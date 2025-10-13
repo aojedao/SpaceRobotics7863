@@ -1,0 +1,116 @@
+import mujoco
+import mujoco.viewer
+import numpy as np
+import time
+import os
+
+# --- Configuration ---
+# Test both the simple version (primitives) and STL version
+# XML_PATH = 'simple_door_test.xml'  # Simple version with primitives
+XML_PATH = 'door_hinge_model.xml'  # STL version with your custom meshes 
+
+def load_and_simulate_door(xml_path):
+    """
+    Loads the MJCF model, runs a simulation loop, and visualizes the result.
+    Applies control to cyclically open and close the door joint.
+    """
+    if not os.path.exists(xml_path):
+        print(f"Error: XML file not found at '{xml_path}'.")
+        return
+
+    try:
+        # 1. Load the model from the MJCF XML file
+        print(f"Loading model: {xml_path}")
+        model = mujoco.MjModel.from_xml_path(xml_path)
+        data = mujoco.MjData(model)
+        print("✓ Model loaded successfully!")
+        
+    except Exception as e:
+        print(f"❌ MuJoCo Model Loading Error: {e}")
+        print("Make sure Box.stl and Door.stl files are in the same directory as the XML file.")
+        return
+
+    # 2. Print model info 
+    print(f"Model has {model.njnt} joints and {model.nu} actuators")
+    
+    # List all joints for debugging
+    print("Available joints:")
+    for i in range(model.njnt):
+        joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+        print(f"  {i}: {joint_name}")
+    
+    if model.nu > 0:
+        print("Available actuators:")
+        for i in range(model.nu):
+            actuator_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            print(f"  {i}: {actuator_name}")
+    else:
+        print("✓ No actuators - door will move freely under physics!")
+    
+    # Get the joint info (no actuator needed for free movement)
+    try:
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, 'door_hinge')
+        
+        if joint_id < 0:
+            raise ValueError("door_hinge joint not found")
+        
+        # Get the range defined in the XML for the joint (e.g., [0, 90])
+        joint_range = model.jnt_range[joint_id]
+        min_angle, max_angle = joint_range[0], joint_range[1]
+        print(f"✓ Door hinge joint found - Range: {min_angle:.1f}° to {max_angle:.1f}°")
+        
+    except (ValueError, IndexError) as e:
+        print(f"❌ Error: {e}")
+        print("Please check that 'door_hinge' joint exists in your XML file.")
+        return
+
+    # 3. Initialize the MuJoCo Viewer
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        # Initialize door position and velocity to zero
+        if joint_id >= 0:
+            data.qpos[joint_id] = np.pi*0.5  # Set door angle to 0°
+            if joint_id < len(data.qvel):
+                data.qvel[joint_id] = 0.0  # Set door velocity to 0°/s
+        
+        # Forward kinematics to update the visualization
+        mujoco.mj_forward(model, data)
+        
+        print("Starting free physics simulation. Press ESC to quit.")
+        print("💡 Try interacting with the door using the mouse - you can click and drag objects!")
+        
+        # Simulation loop parameters
+        duration = 60.0  # seconds - longer duration for free physics exploration
+        start_time = data.time
+
+        # Run the simulation
+        while viewer.is_running() and data.time - start_time < duration:
+            step_start = time.time()
+            
+            # --- Free Physics Simulation ---
+            # No control input - the door moves purely under physics
+            # You can interact with it using the mouse in the viewer
+            
+            # --- Simulation Step ---
+            mujoco.mj_step(model, data)
+
+            # --- Viewer Update ---
+            viewer.sync()
+
+            # --- Print joint state occasionally ---
+            if int(data.time * 10) % 5 == 0:  # Every 2.5 seconds
+                if joint_id >= 0:
+                    joint_pos = data.qpos[joint_id] * 180 / np.pi  # Convert to degrees
+                    joint_vel = data.qvel[joint_id] * 180 / np.pi if joint_id < len(data.qvel) else 0
+                    print(f"Time: {data.time:.1f}s - Door angle: {joint_pos:.1f}°, velocity: {joint_vel:.1f}°/s")
+
+            # --- Real-time synchronization ---
+            elapsed = time.time() - step_start
+            time_to_wait = model.opt.timestep - elapsed
+            if time_to_wait > 0:
+                time.sleep(time_to_wait)
+        
+        print("Free physics simulation finished.")
+
+
+if __name__ == '__main__':
+    load_and_simulate_door(XML_PATH)

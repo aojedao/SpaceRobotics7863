@@ -1,0 +1,3 @@
+Sun Oct  5 18:31:39 2025
+ERROR: gladLoadGL error
+

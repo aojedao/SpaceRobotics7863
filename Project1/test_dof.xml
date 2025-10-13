@@ -1,0 +1,24 @@
+<mujoco model="combined_zero_gravity_sim">
+  <compiler angle="radian" meshdir="."/>
+  <size njmax="2000" nconmax="1000"/>
+  <option timestep="0.002" gravity="0 0 0" integrator="Euler" cone="elliptic" jacobian="sparse" solver="Newton" iterations="50"/>
+  <visual>
+    <global azimuth="-120" elevation="-20"/>
+  </visual>
+  <asset>
+    <mesh name="Box" file="Box.stl"/>
+    <mesh name="Door" file="Door.stl"/>
+    <material name="mat_box" rgba="0.7 0.5 0.3 1"/>
+    <material name="mat_door" rgba="0.3 0.5 0.7 1"/>
+  </asset>
+  <worldbody>
+    <body name="box_door_assembly" pos="2.5 1.5 0.5">
+      <freejoint name="assembly_freejoint"/>
+      <geom name="box_geom" type="mesh" mesh="Box" material="mat_box"/>
+      <body name="Hinged_Door">
+        <joint name="door_hinge" type="hinge" pos="0.075 -0.02 0.165" axis="0 0 1" range="0 1.5708"/>
+        <geom name="door_geom" type="mesh" mesh="Door" material="mat_door"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

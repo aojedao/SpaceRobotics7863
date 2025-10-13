@@ -1,0 +1,62 @@
+<mujoco model="Hinge_Mechanism">
+  <!-- COMPILER SETTINGS -->
+  <compiler angle="degree" coordinate="local" inertiafromgeom="true" meshdir="." />
+  
+  <!-- DEFAULTS -->
+  <default>
+    <!-- Set default material properties for all geometries -->
+    <geom type="mesh" contype="1" conaffinity="1" density="1000"/>
+    <!-- Default joint settings -->
+    <joint armature="0.01" damping="1.0" />
+  </default>
+
+  <!-- ASSETS: Define meshes and materials -->
+  <asset>
+    <!-- Material for the box (a base color) -->
+    <material name="mat_box" rgba="0.6 0.6 0.6 1"/>
+    <!-- Material for the door (a distinctive color) -->
+    <material name="mat_door" rgba="0.2 0.4 0.8 1"/>
+    <!-- Default material for geometries -->
+    <material name="geom_default" rgba="0.8 0.8 0.8 1"/>
+
+    <!-- Mesh Definitions -->
+    <mesh name="Box" file="Box.stl"/>
+    <mesh name="Door" file="Door.stl"/>
+  </asset>
+
+<!-- WORLDBODY: Define the physical bodies and their connections -->
+<worldbody>
+    <!-- Floor for contact -->
+    <geom name="floor" type="plane" size="0 0 0.1" rgba="0.9 0.9 0.9 1" />
+    
+    <!-- BODY 1: The Stationary Base (Box) -->
+    <!-- This is attached directly to the worldbody, so it's fixed (inertialess and non-moving) unless a joint is explicitly added.
+         Since we want it to act as a stable base, we make it fixed by omitting a joint. -->
+    <body name="Base_Box" pos="0 0 0.05">
+        <!-- Geometry for visualization and collision -->
+        <geom name="box_geom" mesh="Box" material="mat_box" />
+    
+        <!-- BODY 2: The Movable Door -->
+        <!-- This body will be attached to the Base_Box via a hinge joint. -->
+        <body name="Hinged_Door">
+            <!-- HINGE JOINT (Revolute Joint) -->
+            <!-- 
+                 The hinge joint (type="hinge") connects Hinged_Door to its parent, Base_Box.
+                 pos: The center point of the rotation axis (hinge pin). You need to align this carefully with your CAD design.
+                      For a door, this is typically where the hinge pins are. I've guessed a position based on the geometry ranges (around z=0.165, which is halfway between 0.14 and 0.19)
+                 axis: The direction of the rotation axis. (0 0 1) means rotation around the Z-axis (vertical door swing).
+                 range: Limits the joint movement. Set to 0 to 90 degrees (open from fully closed).
+            -->
+            <joint name="door_hinge" 
+                   type="hinge" 
+                   pos="0.075 -0.02 0.165" 
+                   axis="0 0 1" 
+                   range="0 90" />
+
+            <!-- Geometry for visualization and collision -->
+            <geom name="door_geom" mesh="Door" material="mat_door" />
+        </body>
+    </body>
+  </worldbody>
+
+</mujoco>

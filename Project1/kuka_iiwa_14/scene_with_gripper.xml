@@ -1,0 +1,103 @@
+<mujoco model="iiwa14 scene with gripper">
+  <include file="iiwa14.xml"/>
+
+  <statistic center="0.2 0 0.2" extent="1.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="gripper_base" rgba="0.4 0.4 0.4 1"/>
+    <material name="gripper_finger" rgba="0.8 0.3 0.3 1"/>
+  </asset>
+
+  <default>
+    <default class="gripper">
+      <joint type="slide" axis="0 1 0" range="-0.02 0.02" damping="50" stiffness="5000"/>
+      <general ctrlrange="-1 1" gainprm="300" biasprm="0 -300 -50"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    
+    <!-- Target objects to grasp -->
+    <body name="red_box" pos="0.4 0.2 0.1">
+      <freejoint name="red_box_joint"/>
+      <geom name="red_box_geom" type="box" size="0.025 0.025 0.04" rgba="0.9 0.2 0.2 1" mass="0.2"/>
+    </body>
+    
+    <body name="blue_box" pos="0.4 -0.2 0.1">
+      <freejoint name="blue_box_joint"/>
+      <geom name="blue_box_geom" type="box" size="0.03 0.02 0.035" rgba="0.2 0.2 0.9 1" mass="0.15"/>
+    </body>
+    
+    <body name="green_cylinder" pos="0.5 0 0.08">
+      <freejoint name="green_cylinder_joint"/>
+      <geom name="green_cylinder_geom" type="cylinder" size="0.02 0.04" rgba="0.2 0.9 0.2 1" mass="0.18"/>
+    </body>
+  </worldbody>
+
+    
+    <!-- Simple gripper attached as separate bodies -->
+    <body name="gripper_base" pos="0 0 0.85" euler="0 0 0">
+      <geom name="gripper_palm" type="box" size="0.03 0.025 0.01" material="gripper_base"/>
+      
+      <!-- Left finger -->
+      <body name="left_finger_base" pos="0 0.025 0.02">
+        <joint name="left_finger_joint" type="slide" axis="0 1 0" range="-0.02 0.02" class="gripper"/>
+        <geom name="left_finger" type="box" size="0.008 0.02 0.025" material="gripper_finger"/>
+        <body name="left_fingertip" pos="0 0.015 0">
+          <geom name="left_fingertip" type="box" size="0.008 0.005 0.025" material="gripper_finger"/>
+        </body>
+      </body>
+      
+      <!-- Right finger -->
+      <body name="right_finger_base" pos="0 -0.025 0.02">
+        <joint name="right_finger_joint" type="slide" axis="0 1 0" range="-0.02 0.02" class="gripper"/>
+        <geom name="right_finger" type="box" size="0.008 0.02 0.025" material="gripper_finger"/>
+        <body name="right_fingertip" pos="0 -0.015 0">
+          <geom name="right_fingertip" type="box" size="0.008 0.005 0.025" material="gripper_finger"/>
+        </body>
+      </body>
+      
+      <site name="gripper_tip" pos="0 0 0.04" size="0.002" rgba="0 1 1 1"/>
+    </body>
+  </worldbody>
+
+  <!-- Additional gripper actuators -->
+  <actuator>
+    <general name="left_finger_actuator" joint="left_finger_joint" class="gripper"/>
+    <general name="right_finger_actuator" joint="right_finger_joint" class="gripper"/>
+  </actuator>
+
+  <!-- Better grasping contacts -->
+  <contact>
+    <pair geom1="left_fingertip" geom2="red_box_geom" condim="4" friction="1.5 0.1 0.001"/>
+    <pair geom1="right_fingertip" geom2="red_box_geom" condim="4" friction="1.5 0.1 0.001"/>
+    <pair geom1="left_fingertip" geom2="blue_box_geom" condim="4" friction="1.5 0.1 0.001"/>
+    <pair geom1="right_fingertip" geom2="blue_box_geom" condim="4" friction="1.5 0.1 0.001"/>
+    <pair geom1="left_fingertip" geom2="green_cylinder_geom" condim="4" friction="1.5 0.1 0.001"/>
+    <pair geom1="right_fingertip" geom2="green_cylinder_geom" condim="4" friction="1.5 0.1 0.001"/>
+  </contact>
+
+  <!-- Gripper sensors -->
+  <sensor>
+    <jointpos name="left_finger_pos" joint="left_finger_joint"/>
+    <jointpos name="right_finger_pos" joint="right_finger_joint"/>
+  </sensor>
+
+  <!-- Keyframes for different poses -->
+  <keyframe>
+    <key name="home_gripper" qpos="0 0.785398 0 -1.5708 0 0 0 0 0" ctrl="0 0.785398 0 -1.5708 0 0 0 0 0"/>
+    <key name="ready_grasp" qpos="0.2 0.5 0 -1.2 0 1.0 0 -0.01 -0.01" ctrl="0.2 0.5 0 -1.2 0 1.0 0 -0.01 -0.01"/>
+  </keyframe>
+</mujoco>
