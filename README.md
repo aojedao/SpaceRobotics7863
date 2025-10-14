@@ -4,6 +4,8 @@ This repository contains projects and coursework for ROB-GY 7863: Space Robotics
 
 ## Project 1: Simulating In-Space Disassembly Tasks in a Zero-G Environment
 
+![ezgif-496f20b11beee9.gif](ezgif-496f20b11beee9.gif)
+
 ### Project Overview
 
 This project focuses on the development of a high-fidelity simulation environment for in-space robotic disassembly tasks, specifically simulating a 7-axis KUKA IIWA manipulator performing an unscrewing operation on a free-floating object in a microgravity environment.
