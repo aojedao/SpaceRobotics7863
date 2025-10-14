@@ -1,7 +1,7 @@
-<mujoco model="integrated_iiwa14">
+<mujoco model="integrated_iiwa14_iss_orbit">
   <compiler angle="radian"  autolimits="true"/>
 
-  <option integrator="implicitfast" gravity="0 0 0" timestep="0.002"/>
+  <option integrator="implicitfast" gravity="0 0 -8.69" timestep="0.002"/>
 
   <default>
     <default class="iiwa">
@@ -111,7 +111,8 @@
     <mesh name="ISSDestiny" file="ISSArea1.stl" scale="0.1 0.1 0.1" />
 
     <!-- Environment textures -->
-    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="skybox" builtin="gradient" rgb1="0.05 0.05 0.2" rgb2="0 0 0" width="512" height="3072"/>
+    <texture name="earth_texture" builtin="checker" rgb1="0.2 0.3 0.8" rgb2="0.1 0.6 0.2" width="512" height="512"/>
         
   </asset>
 
@@ -300,22 +301,39 @@
     </body>
   
     
-    <!-- Environment Container -->
+    <!-- ISS Orbital Environment - SUBTLE AND ATMOSPHERIC -->
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     
-    <!-- Cylindrical Container made of box walls for reliable collision -->
+    <!-- Earth visualization (subtle background) -->
+    <geom name="earth_sphere" type="sphere" size="50" pos="0 0 -60" rgba="0.2 0.4 0.8 0.6" contype="0" conaffinity="0"/>
+    <geom name="earth_core" type="sphere" size="10" pos="0 0 -60" rgba="0.8 0.3 0.1 0.8" contype="0" conaffinity="0"/>
+    
+    <!-- Subtle orbital path visualization -->
+    <geom name="orbital_path" type="cylinder" size="60 0.05" pos="0 0 -60" rgba="1 1 0 0.2" contype="0" conaffinity="0"/>
+    
+    <!-- ISS Module walls for collision (representing Destiny lab module) -->
     <!-- Floor -->
-    <geom name="floor" type="box" size="4 1.3 0.1" pos="0 0.5 -0.1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_floor" type="box" size="4 1.3 0.1" pos="0 0.5 -0.1" material="mat_walls" contype="1" conaffinity="1"/>
     <!-- Ceiling -->  
-    <geom name="ceiling" type="box" size="4 1.3 0.1" pos="0 0.5 2.0" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_ceiling" type="box" size="4 1.3 0.1" pos="0 0.5 2.0" material="mat_walls" contype="1" conaffinity="1"/>
     <!-- Walls -->
-    <geom name="wall_x_pos" type="box" size="0.1 1.3 1" pos="4 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
-    <geom name="wall_x_neg" type="box" size="0.1 1.3 1" pos="-2.2 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
-    <geom name="wall_y_pos" type="box" size="4 0.1 1" pos="0 1.8 1" material="mat_walls" contype="1" conaffinity="1"/>
-    <geom name="wall_y_neg" type="box" size="4 0.1 1" pos="0 -0.6 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_x_pos" type="box" size="0.1 1.3 1" pos="4 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_x_neg" type="box" size="0.1 1.3 1" pos="-2.2 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_y_pos" type="box" size="4 0.1 1" pos="0 1.8 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_y_neg" type="box" size="4 0.1 1" pos="0 -0.6 1" material="mat_walls" contype="1" conaffinity="1"/>
 
-    <!-- contype and conaffinity set to 1 for walls to enable collision with everything, if just aesthetic leave 0 -->
+    <!-- ISS Destiny module visualization -->
     <geom name="ISSDestiny_geom" type="mesh" mesh="ISSDestiny" pos="-5.0 -2.8 1.1" contype="0" conaffinity="0" material="mat_walls"/> 
+    
+    <!-- Subtle Orbital motion indicators -->
+    <geom name="orbital_center" type="sphere" size="0.05" pos="0 0 0" rgba="1 1 0 0.8" contype="0" conaffinity="0"/>
+    <geom name="earth_direction" type="capsule" size="0.02 30" pos="0 0 -30" rgba="0.8 0.8 0.2 0.3" contype="0" conaffinity="0"/>
+    
+    <!-- Subtle motion trail markers -->
+    <geom name="trail_1" type="sphere" size="0.03" pos="60 0 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    <geom name="trail_2" type="sphere" size="0.03" pos="0 60 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    <geom name="trail_3" type="sphere" size="0.03" pos="-60 0 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    <geom name="trail_4" type="sphere" size="0.03" pos="0 -60 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
         
     
     <!-- Box/Door Assembly (floating in zero gravity, positioned closer to robot) -->

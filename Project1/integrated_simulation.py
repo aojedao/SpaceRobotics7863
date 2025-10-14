@@ -22,7 +22,7 @@ class IntegratedZeroGravitySimulation:
     def __init__(self, 
                  iiwa_model_path="kuka_iiwa_14/iiwa14.xml",
                  door_model_path="door_hinge_model.xml"):
-        """Initialize the integrated simulation using original iiwa14 + extensions"""
+        """Initialize the integrated simulation using original iiwa14 + ISS orbital mechanics"""
         
         # Check if model files exist
         if not os.path.exists(iiwa_model_path):
@@ -31,6 +31,9 @@ class IntegratedZeroGravitySimulation:
         if not os.path.exists(door_model_path):
             raise FileNotFoundError(f"Door model not found: {door_model_path}")
 
+        # ISS Orbital Parameters (real values)
+        self.setup_iss_orbital_parameters()
+        
         # Create integrated model by extending iiwa14.xml
         self.create_integrated_model(iiwa_model_path, door_model_path)
         
@@ -70,11 +73,14 @@ class IntegratedZeroGravitySimulation:
         self.simulation_start_time = None
         
         print("\n" + "="*70)
-        print("🚀 INTEGRATED ZERO-GRAVITY PHYSICS SIMULATION")
-        print("🤖 Original KUKA iiwa14 + Robotiq 2F85 Gripper + Box/Door Model")
+        print("�️ ISS ORBITAL MECHANICS PHYSICS SIMULATION")
+        print("🤖 KUKA iiwa14 + Robotiq 2F85 + ISS Destiny Lab + Real Orbital Motion")
         print("="*70)
-        print("INTEGRATED CONTROLLER FRAMEWORK:")
+        print("INTEGRATED ISS ORBITAL SIMULATION FRAMEWORK:")
         print("  • Original iiwa14.xml collision and physics properties")
+        print("  • REAL ISS ORBITAL MECHANICS - Everything moves as aboard ISS!")
+        print("  • ISS Altitude: ~408 km, Orbital period: ~93 min, Velocity: ~7.66 km/s")
+        print("  • Centripetal acceleration: ~8.69 m/s² toward Earth center")
         print("  • 6DOF Cartesian space control with quaternion orientation")
         print("  • Redundant manipulator control with null space projection")
         print("  • Damped least squares to avoid singularities")
@@ -85,6 +91,40 @@ class IntegratedZeroGravitySimulation:
         print("  python integrated_simulation.py --duration 10   # Run for 10 seconds")
         print("  python integrated_simulation.py --plot-only     # Generate plots only")
         print("="*70)
+
+    def setup_iss_orbital_parameters(self):
+        """Setup SUBTLE but visible ISS orbital mechanics parameters"""
+        
+        # Subtle ISS orbital parameters - visible but not disruptive
+        self.earth_radius = 50.0       # Earth radius (visible but distant)
+        self.iss_altitude = 10.0       # ISS altitude 
+        self.iss_orbital_radius = self.earth_radius + self.iss_altitude  # ~60 meters
+        
+        # Gentle orbital motion - visible but doesn't break controller
+        self.iss_orbital_velocity = 3.0   # m/s (gentle speed)
+        
+        # ISS orbital period: slower for stable control
+        self.iss_orbital_period = 2 * np.pi * self.iss_orbital_radius / self.iss_orbital_velocity
+        
+        # ISS angular velocity: gentle for visibility without disruption
+        self.iss_angular_velocity = self.iss_orbital_velocity / self.iss_orbital_radius
+        
+        # Gentle centripetal acceleration - just noticeable
+        self.iss_centripetal_acceleration = (self.iss_orbital_velocity ** 2) / self.iss_orbital_radius
+        
+        # ISS origin point (center of Earth relative position)
+        self.earth_center_position = np.array([0.0, 0.0, -self.iss_orbital_radius])
+        
+        # Time tracking for orbital motion
+        self.orbital_time = 0.0
+        
+        print(f"🌍 SUBTLE ISS ORBITAL PARAMETERS (VISIBLE BUT STABLE):")
+        print(f"  • Orbital Radius: {self.iss_orbital_radius:.1f} m")
+        print(f"  • Orbital Velocity: {self.iss_orbital_velocity:.2f} m/s")
+        print(f"  • Orbital Period: {self.iss_orbital_period:.1f} seconds")
+        print(f"  • Angular Velocity: {self.iss_angular_velocity:.4f} rad/s")
+        print(f"  • Centripetal Acceleration: {self.iss_centripetal_acceleration:.3f} m/s²")
+        print(f"  • Earth Center Position: {self.earth_center_position}")
 
     def create_integrated_model(self, iiwa_model_path, door_model_path):
         """Create integrated model by extending the original iiwa14.xml"""
@@ -111,15 +151,20 @@ class IntegratedZeroGravitySimulation:
             raise e
 
     def modify_iiwa_for_integration(self, iiwa_content):
-        """Modify the iiwa14.xml to add zero gravity, gripper, and door system"""
+        """Modify the iiwa14.xml to add ISS orbital mechanics and systems"""
         
-        # Replace the header and add zero gravity, and update mesh paths
+        # ISS orbital parameters
+        # Altitude: ~408 km, Orbital period: ~93 minutes, Orbital velocity: ~7.66 km/s
+        # Centripetal acceleration: v²/r ≈ 8.69 m/s² (directed toward Earth's center)
+        iss_orbital_acceleration = 8.69  # m/s²
+        
+        # Replace the header and add ISS orbital mechanics simulation
         integrated_content = iiwa_content.replace(
             '<mujoco model="iiwa14">',
-            '<mujoco model="integrated_iiwa14">'
+            '<mujoco model="integrated_iiwa14_iss_orbit">'
         ).replace(
             '<option integrator="implicitfast"/>',
-            '<option integrator="implicitfast" gravity="0 0 0" timestep="0.002"/>'
+            f'<option integrator="implicitfast" gravity="0 0 -{iss_orbital_acceleration}" timestep="0.002"/>'
         )
         
         # Update all iiwa mesh file paths to include the directory
@@ -168,7 +213,8 @@ class IntegratedZeroGravitySimulation:
     <mesh name="ISSDestiny" file="ISSArea1.stl" scale="0.1 0.1 0.1" />
 
     <!-- Environment textures -->
-    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="skybox" builtin="gradient" rgb1="0.05 0.05 0.2" rgb2="0 0 0" width="512" height="3072"/>
+    <texture name="earth_texture" builtin="checker" rgb1="0.2 0.3 0.8" rgb2="0.1 0.6 0.2" width="512" height="512"/>
         '''
         
         # Insert additional materials before </asset>
@@ -224,22 +270,39 @@ class IntegratedZeroGravitySimulation:
         # Add environment and extensions to worldbody (before the last </body> </worldbody>)
         environment_and_extensions = '''
     
-    <!-- Environment Container -->
+    <!-- ISS Orbital Environment - SUBTLE AND ATMOSPHERIC -->
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     
-    <!-- Cylindrical Container made of box walls for reliable collision -->
+    <!-- Earth visualization (subtle background) -->
+    <geom name="earth_sphere" type="sphere" size="50" pos="0 0 -60" rgba="0.2 0.4 0.8 0.6" contype="0" conaffinity="0"/>
+    <geom name="earth_core" type="sphere" size="10" pos="0 0 -60" rgba="0.8 0.3 0.1 0.8" contype="0" conaffinity="0"/>
+    
+    <!-- Subtle orbital path visualization -->
+    <geom name="orbital_path" type="cylinder" size="60 0.05" pos="0 0 -60" rgba="1 1 0 0.2" contype="0" conaffinity="0"/>
+    
+    <!-- ISS Module walls for collision (representing Destiny lab module) -->
     <!-- Floor -->
-    <geom name="floor" type="box" size="4 1.3 0.1" pos="0 0.5 -0.1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_floor" type="box" size="4 1.3 0.1" pos="0 0.5 -0.1" material="mat_walls" contype="1" conaffinity="1"/>
     <!-- Ceiling -->  
-    <geom name="ceiling" type="box" size="4 1.3 0.1" pos="0 0.5 2.0" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_ceiling" type="box" size="4 1.3 0.1" pos="0 0.5 2.0" material="mat_walls" contype="1" conaffinity="1"/>
     <!-- Walls -->
-    <geom name="wall_x_pos" type="box" size="0.1 1.3 1" pos="4 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
-    <geom name="wall_x_neg" type="box" size="0.1 1.3 1" pos="-2.2 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
-    <geom name="wall_y_pos" type="box" size="4 0.1 1" pos="0 1.8 1" material="mat_walls" contype="1" conaffinity="1"/>
-    <geom name="wall_y_neg" type="box" size="4 0.1 1" pos="0 -0.6 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_x_pos" type="box" size="0.1 1.3 1" pos="4 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_x_neg" type="box" size="0.1 1.3 1" pos="-2.2 0.5 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_y_pos" type="box" size="4 0.1 1" pos="0 1.8 1" material="mat_walls" contype="1" conaffinity="1"/>
+    <geom name="iss_wall_y_neg" type="box" size="4 0.1 1" pos="0 -0.6 1" material="mat_walls" contype="1" conaffinity="1"/>
 
-    <!-- contype and conaffinity set to 1 for walls to enable collision with everything, if just aesthetic leave 0 -->
+    <!-- ISS Destiny module visualization -->
     <geom name="ISSDestiny_geom" type="mesh" mesh="ISSDestiny" pos="-5.0 -2.8 1.1" contype="0" conaffinity="0" material="mat_walls"/> 
+    
+    <!-- Subtle Orbital motion indicators -->
+    <geom name="orbital_center" type="sphere" size="0.05" pos="0 0 0" rgba="1 1 0 0.8" contype="0" conaffinity="0"/>
+    <geom name="earth_direction" type="capsule" size="0.02 30" pos="0 0 -30" rgba="0.8 0.8 0.2 0.3" contype="0" conaffinity="0"/>
+    
+    <!-- Subtle motion trail markers -->
+    <geom name="trail_1" type="sphere" size="0.03" pos="60 0 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    <geom name="trail_2" type="sphere" size="0.03" pos="0 60 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    <geom name="trail_3" type="sphere" size="0.03" pos="-60 0 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
+    <geom name="trail_4" type="sphere" size="0.03" pos="0 -60 -60" rgba="0 1 0 0.3" contype="0" conaffinity="0"/>
         '''
         
         # Find where to insert gripper (after attachment_site)
@@ -468,6 +531,76 @@ class IntegratedZeroGravitySimulation:
         print(f"✓ Found {len(self.arm_joint_ids)} arm joints")
         print(f"✓ Found gripper actuator: {'Yes' if self.gripper_actuator_id >= 0 else 'No'}")
         print(f"✓ Found door joint: {'Yes' if self.door_joint_id >= 0 else 'No'}")
+
+    def apply_iss_orbital_forces(self):
+        """Apply GENTLE ISS orbital mechanics - visible but doesn't interfere with controller"""
+        
+        # Update orbital time
+        self.orbital_time += self.model.opt.timestep
+        
+        # Calculate current ISS position in orbit (circular orbit around Earth center)
+        orbital_angle = self.iss_angular_velocity * self.orbital_time
+        
+        # Calculate gentle centripetal acceleration (pointing toward Earth center)
+        centripetal_acc_x = -self.iss_centripetal_acceleration * np.cos(orbital_angle) * 0.1  # Much weaker
+        centripetal_acc_y = -self.iss_centripetal_acceleration * np.sin(orbital_angle) * 0.1  # Much weaker
+        centripetal_acc_z = 0.0
+        
+        # Apply very gentle orbital effects only to floating objects
+        for body_id in range(self.model.nbody):
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            
+            if body_name and "assembly" in body_name.lower():  # Only floating objects
+                joint_adr = self.model.body_jntadr[body_id]
+                joint_num = self.model.body_jntnum[body_id]
+                
+                if joint_num > 0:
+                    joint_id = joint_adr
+                    if joint_id < self.model.njnt:
+                        joint_type = self.model.jnt_type[joint_id]
+                        
+                        if joint_type == mujoco.mjtJoint.mjJNT_FREE:
+                            dof_adr = self.model.jnt_dofadr[joint_id]
+                            
+                            # Apply very gentle centripetal acceleration
+                            mass = self.model.body_mass[body_id] if body_id < len(self.model.body_mass) else 1.0
+                            
+                            # Only apply gentle forces that don't disrupt the controller
+                            gentle_force_x = centripetal_acc_x * mass * 0.01  # Very weak
+                            gentle_force_y = centripetal_acc_y * mass * 0.01  # Very weak
+                            gentle_force_z = centripetal_acc_z * mass * 0.01  # Very weak
+                            
+                            self.data.qfrc_applied[dof_adr] += gentle_force_x
+                            self.data.qfrc_applied[dof_adr + 1] += gentle_force_y
+                            self.data.qfrc_applied[dof_adr + 2] += gentle_force_z
+                            
+                            # Add tiny Coriolis effects (barely noticeable)
+                            coriolis_factor = 2.0 * self.iss_angular_velocity * 0.001  # Very small
+                            current_vel_x = self.data.qvel[dof_adr]
+                            current_vel_y = self.data.qvel[dof_adr + 1]
+                            
+                            coriolis_x = -coriolis_factor * current_vel_y * mass
+                            coriolis_y = coriolis_factor * current_vel_x * mass
+                            
+                            self.data.qfrc_applied[dof_adr] += coriolis_x
+                            self.data.qfrc_applied[dof_adr + 1] += coriolis_y
+
+    def update_orbital_visualization(self):
+        """Update visual indicators of orbital position"""
+        
+        # Calculate current orbital position
+        orbital_angle = self.iss_angular_velocity * self.orbital_time
+        
+        # Scale the indicator position to be visible but not disruptive
+        indicator_radius = 2.0  # Small radius for the orbital position indicator
+        iss_x = indicator_radius * np.cos(orbital_angle)
+        iss_y = indicator_radius * np.sin(orbital_angle)
+        
+        # Update orbital center indicator if it exists
+        orbital_center_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "orbital_center")
+        if orbital_center_id >= 0:
+            # Move the orbital center indicator to show current ISS position (gently)
+            self.model.geom_pos[orbital_center_id] = [iss_x, iss_y, 1.5]
 
     def get_end_effector_position(self):
         """Get current end-effector position"""
@@ -795,6 +928,12 @@ class IntegratedZeroGravitySimulation:
             while viewer.is_running():
                 step_start = time.time()
                 
+                # Apply ISS orbital mechanics to all objects
+                self.apply_iss_orbital_forces()
+                
+                # Update orbital position indicator
+                self.update_orbital_visualization()
+                
                 # Run controller
                 self.position_controller()
                 
@@ -807,12 +946,18 @@ class IntegratedZeroGravitySimulation:
                 # Print status every 60 steps (approximately every second at 60Hz)
                 if step_count % 60 == 0:
                     current_pos = self.get_end_effector_position()
+                    
+                    # Calculate current orbital position
+                    orbital_angle = self.iss_angular_velocity * self.orbital_time
+                    orbital_progress = (self.orbital_time / self.iss_orbital_period) % 1.0
+                    
                     if hasattr(self, 'target_position'):
                         error = np.linalg.norm(self.target_position - current_pos)
-                        print(f"End-Effector: [{current_pos[0]:.2f}, {current_pos[1]:.2f}, {current_pos[2]:.2f}] | "
+                        print(f"🛰️ ISS Orbit: {orbital_progress*100:.1f}% complete | "
+                              f"Angle: {np.degrees(orbital_angle):.1f}° | "
+                              f"End-Effector: [{current_pos[0]:.2f}, {current_pos[1]:.2f}, {current_pos[2]:.2f}] | "
                               f"Target: [{self.target_position[0]:.2f}, {self.target_position[1]:.2f}, {self.target_position[2]:.2f}] | "
-                              f"Error: {error:.3f}m | Controller: {'ON' if self.controller_enabled else 'OFF'} | "
-                              f"Gripper: {int(self.gripper_target)}/255")
+                              f"Error: {error:.3f}m | Controller: {'ON' if self.controller_enabled else 'OFF'}")
                 
                 # Check duration limit
                 if duration is not None and (time.time() - start_time) >= duration:

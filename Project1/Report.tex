@@ -33,60 +33,58 @@
 
 
 \begin{abstract}
-This paper presents the development of a simulation environment for in-space robotic disassembly tasks, specifically focusing on unscrewing operations in zero-gravity (zero-G). The simulation, built within the MuJoCo physics engine, models a seven-axis KUKA IIWA manipulator, a common choice in aerospace applications. The robot's objective is to interact with a freely floating box, created from an STL file, and perform an unscrewing task. The environment is enclosed by four walls to handle collision detection. To address kinematic singularities during manipulation, a Jacobian Damped Least Squares (DLS) controller is implemented. This work leverages models from Google's MuJoCo Menagerie to create a realistic and robust simulation for testing and validation of autonomous robotic procedures in space.
+This paper presents a simulation environment developed for in-space robotic disassembly tasks, focusing on manipulation operations in a microgravity environment. The simulation, built using the MuJoCo physics engine, models a seven-axis KUKA IIWA manipulator interacting with a free-floating object. The objective is to perform precise manipulation tasks on a box created from a custom STL file within an enclosed environment. To address the challenges of kinematic singularities, a Jacobian Damped Least Squares (DLS) controller is implemented. This work leverages models from Google's MuJoCo Menagerie to create a realistic and robust simulation for testing and validating autonomous robotic procedures in space.
 \end{abstract}
 
 \IEEEpeerreviewmaketitle
 
 \section{Introduction}
-On-orbit servicing, assembly, and manufacturing (OSAM) are critical for the sustainability of space operations. Robotic systems are essential for these tasks, reducing valuable astronaut time and mission costs. This project tackles a key OSAM challenge: precise robotic manipulation  of free-floating objects in zero-gravity (zero-G). The project focused on simulating an unscrewing task, which requires robust control to handle complex contact dynamics and the manipulator's kinematic singularities.
+On-orbit servicing, assembly, and manufacturing (OSAM) are critical for the sustainability of space operations, with robotic systems being essential for reducing astronaut workload and mission costs. This project addresses a key OSAM challenge: the precise manipulation of free-floating objects in microgravity. The simulation focuses on tasks requiring robust control to handle complex contact dynamics and a manipulator's kinematic singularities.
 
-To do this, we developed a high-fidelity simulation in MuJoCo featuring a 7-DOF KUKA IIWA manipulator from Google's MuJoCo Menagerie. The robot interacts with a free-floating box within a confined space, simulating an ISS module. Control is achieved with a Jacobian Damped Least Squares (DLS) controller, designed to gracefully handle singularities. This work provides a platform for validating autonomous control strategies for future in-space missions.
+For this purpose, a high-fidelity simulation was developed in MuJoCo featuring a 7-DOF KUKA IIWA manipulator. The robot interacts with a free-floating box within a confined space that simulates a module on the International Space Station (ISS). Control is achieved with a Jacobian Damped Least Squares (DLS) controller, designed to gracefully handle singularities by ensuring the invertibility of the control matrix. The resulting platform is intended for the validation of autonomous control strategies for future in-space missions.
 
 \section{Related Work}
-This work builds on established research in space robotics. The KUKA LBR iiwa has been used in the development of the PULSAR system for in-space assembly, demonstrating its utility in complex robotic tasks~\cite{aslam2022space}. The control of redundant manipulators like the KUKA IIWA often uses Jacobian-based methods, but the standard pseudoinverse approach is unstable near singularities~\cite{chiaverini1997task}. The Damped Least Squares (DLS) method provides a robust alternative by adding a damping factor to maintain stability~\cite{wampler1986manipulator}.
+This work builds on established research in space robotics. The KUKA LBR iiwa has been used in the development of the PULSAR system for in-space assembly by the DLR, demonstrating its utility in complex robotic tasks~\cite{aslam2022space}. The control of redundant manipulators often utilizes Jacobian-based methods; however, the standard pseudoinverse approach is unstable near singularities~\cite{wampler1986manipulator}. The Damped Least Squares (DLS) method provides a robust alternative by adding a damping factor to maintain stability.
 
-Modeling contact with free-floating objects is also a key challenge, with impedance control being a common strategy to manage interaction forces~\cite{yoshida2002impedance}. While our work uses a simplified contact model, it is grounded in principles explored in prior research. High-fidelity simulators like MuJoCo are critical tools for this type of research, enabling rapid testing of dynamics and control~\cite{hurowitz2025redox}.
+Given computational and time constraints, a simplified contact model was chosen, focusing on the kinematic and dynamic challenges of the manipulation task rather than detailed contact force modeling. High-fidelity simulators like MuJoCo are critical tools for this type of research, enabling rapid testing of dynamics and control.
 
 \section{Method}
 \subsection{System Overview}
-The simulation environment, built in MuJoCo, consists of:
+The simulation environment was constructed in two main stages. First, to create a contained workspace, four square walls were modeled, as MuJoCo can have issues with complex geometries like cylinders for containment. Second, for realistic visualization, an official NASA FBX model of the International Space Station (ISS) was imported and sectioned into its constituent modules. The US Lab module was selected as the primary setting for this simulation. However, due to the complexity of the ISS model, it is used for visualization purposes only. For collision detection, the simulation relies on the simpler geometry of the container walls and the bounding box of the target object to ensure computational efficiency.
+
+The environment, built in MuJoCo, consists of:
 \begin{itemize}
-    \item \textbf{KUKA IIWA Manipulator:} A 7-DOF redundant arm model from the MuJoCo Menagerie.
+    \item \textbf{KUKA IIWA Manipulator:} A 7-DOF redundant arm model from the MuJoCo Menagerie, equipped with a Robotiq 2F-85 gripper as the end-effector.
     \item \textbf{Target Object:} A free-floating box with a `freejoint`, with geometry loaded from a custom STL file.
-    \item \textbf{Workspace:} An enclosed area with four static walls for collision detection. The gravitational acceleration is set to $10^{-6} g$ to simulate the microgravity environment of the ISS.
+    \item \textbf{Workspace:} An enclosed area with four static, grounded walls for collision detection. The gravitational acceleration is set to $10^{-6} g$ to simulate the microgravity environment of the ISS.
 \end{itemize}
 A Python-based controller interfaces with MuJoCo to implement the control logic.
 
 \subsection{Concept of Operations}
-The mission involves the robot approaching the floating box, stabilizing it, performing a precise helical unscrewing motion, and then retreating. This sequence tests the controller's ability to manage free-space motion, contact, and precise manipulation.
+The mission involves the robot approaching the floating box, stabilizing it, performing a precise manipulation motion, and then retreating. This sequence tests the controller's ability to manage free-space motion, contact, and precise manipulation. For this stage, the perception stack is skipped, and the pose data of the box and the end-effector is captured directly from the MuJoCo model environment.
 
 \subsection{Damped Least Squares (DLS) Control}
-The robot's end-effector velocity $\dot{x}$ is related to its joint velocities $\dot{q}$ by $\dot{x} = J(q) \dot{q}$, where $J(q)$ is the Jacobian. To achieve a desired velocity $\dot{x}_d$ while avoiding singularities, we use the DLS solution:
+The robot's end-effector velocity $\dot{x}$ is related to its joint velocities $\dot{q}$ by $\dot{x} = J(q) \dot{q}$, where $J(q)$ is the Jacobian. To achieve a desired velocity $\dot{x}_d$ while avoiding singularities, the DLS solution is used:
 \begin{equation}
 \dot{q} = J^T (J J^T + \lambda^2 I)^{-1} \dot{x}_d
 \label{eq:dls}
 \end{equation}
-where $I$ is the identity matrix and $\lambda$ is a damping factor. This factor is critical for stability, as it ensures the matrix $(J J^T + \lambda^2 I)$ remains invertible even when the manipulator is near a singularity (i.e., when $J J^T$ is ill-conditioned). The value of $\lambda$ can be made adaptive based on the manipulability measure $w(q) = \sqrt{\det(J(q)J(q)^T)}$, increasing as $w(q)$ approaches zero.
+where $I$ is the identity matrix and $\lambda$ is a damping factor. This factor is critical for stability, as it ensures the matrix $(J J^T + \lambda^2 I)$ remains invertible even when the manipulator is near a singularity.
 
 \section{Experiments and Results}
-\subsection{Experimental Setup and Metrics}
-We propose a set of experiments to validate the system. Performance is measured by:
+\subsection{Experimental Setup and Validation}
+The validation of the simulation was performed in several stages. Initially, two separate environments were created to test the basic physics: one to validate the behavior of the self-created STL box model and another for the KUKA IIWA arm, both under standard gravity.
+
+Following this, the KUKA IIWA was fitted with a Robotiq 2F-85 gripper as its end-effector. The complete model, including the robot and the free-floating box, was then imported into a bounded box area with grounded walls. Collision tests were performed to validate that the box would correctly bounce off the walls, confirming the collision physics.
+
+Finally, the DLS controller was implemented on the robot arm. The controller gains and damping values were tuned specifically for the microgravity environment, accounting for the free-falling effect present on the ISS. To validate these tests and analyze the system's performance, a custom data visualizer was created using the Matplotlib library. Performance was measured by:
 \begin{itemize}
     \item \textbf{End-Effector Tracking Error:} Position and orientation error between the desired and actual pose.
-    \item \textbf{Manipulability Index:} The value of $w(q)$ over time to monitor proximity to singularities.
     \item \textbf{Joint Velocities:} To ensure smooth and bounded motion.
 \end{itemize}
 
-\subsection{Experimental Plan}
-\begin{enumerate}
-    \item \textbf{Baseline Trajectory Tracking:} The robot tracks a path in free space to validate the DLS controller without contact.
-    \item \textbf{Contact and Stabilization:} The robot approaches and makes contact with the floating box to analyze post-contact dynamics.
-    \item \textbf{Full Disassembly Task:} The robot performs the complete unscrewing mission.
-\end{enumerate}
-
 \subsection{Expected Results}
-We expect to show that the DLS controller enables the successful completion of the unscrewing task. We anticipate minimal tracking error in free space, with a slight increase during contact and near singularities as the damping term activates to ensure stability. Plots of the manipulability index should confirm that the robot effectively avoids singular configurations. The final result will be a successful simulation of the disassembly task, validating the control approach.
+It is expected that the DLS controller will enable the successful completion of the manipulation task. Minimal tracking error is anticipated in free space, with a slight increase during contact and near singularities as the damping term activates to ensure stability. The final result will be a successful simulation of the task, validating the control approach.
 
 \section{Conclusion and Future Work}
 This project demonstrates a simulation environment for in-space robotic disassembly using a KUKA IIWA arm with a DLS controller. This provides a valuable platform for developing and de-risking autonomous technologies for OSAM missions.
