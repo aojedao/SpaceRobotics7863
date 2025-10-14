@@ -4,8 +4,6 @@ This repository contains projects and coursework for ROB-GY 7863: Space Robotics
 
 ## Project 1: Simulating In-Space Disassembly Tasks in a Zero-G Environment
 
-**Author:** Alejandro Ojeda Olarte (ao2709@nyu.edu)
-
 ### Project Overview
 
 This project focuses on the development of a high-fidelity simulation environment for in-space robotic disassembly tasks, specifically simulating a 7-axis KUKA IIWA manipulator performing an unscrewing operation on a free-floating object in a microgravity environment.
@@ -37,6 +35,7 @@ The simulation is built using the MuJoCo physics engine and leverages models fro
     ```bash
     python integrated_simulation.py
     ```
+    You can run more parameters using command line arguments such as `--duration` or `--plot-only`.
 
 ### Repository Structure
 
@@ -46,4 +45,3 @@ The simulation is built using the MuJoCo physics engine and leverages models fro
   - `*.stl`: STL files for custom geometries like the target box.
   - `Report.tex` / `ref.bib`: The LaTeX source for the project report and its citations.
 - `mujoco_menagerie/`: Contains the original robot models from the Google MuJoCo Menagerie.
-- `SpaceRobotEnv/`: Contains related work on a custom Gym environment.
