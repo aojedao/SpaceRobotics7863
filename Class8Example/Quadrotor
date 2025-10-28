@@ -1,0 +1,67 @@
+import numpy as np
+import numpy.random as rng
+from scipy.linalg import solve_discrete_are
+
+# definition of the matrices and example of control
+m = 0.5
+I = 0.1
+r = 0.15
+g = 9.81
+dt = 0.01
+length = 0.15
+
+A = np.eye(6)
+A[0,1] = dt
+A[1,4] = -g * dt
+A[2,3] = dt
+A[4,5] = dt
+
+B = np.zeros((6,2))
+B[3,0] = dt/m
+B[3,1] = dt/m
+B[5,0] = length * dt/I
+B[5,1] = -length * dt/I
+
+
+C = np.eye(6)
+
+#Vector is (x,vx,y,vy,theta,omega)
+
+Sigma_x = np.diag([1e-2, 1e-2,1e-2, 1e-2, 1e-2, 1e-2]) #These are the dimensions of the noise, like cm, m etc
+Sigma_y = np.diag([1e-2, 1e-2,1e-2, 1e-2, 1e-2, 1e-2])
+
+
+Q_x= np.diag([1e-1, 1e-1,1e-1, 1e-1, 1e-1, 1e-1])
+Q_u= np.diag([1e-2, 1e-2])
+
+x_0 = np.array([[0.0], [0.0], [0.0], [0.0], [0.0], [0.0]]) # it is grounded
+P_0 = np.diag([1e-2, 1e-2,1e-2, 1e-2, 1e-2, 1e-2]) #it should be small since we know the initial position
+
+def dynamics(A,B, Sigma_x, x_k, u_kp1, rng):
+    # use a zero-mean noise vector with the same dimension as the state
+    w_k = rng.multivariate_normal(mean=np.zeros(x_k.shape[0]), cov=Sigma_x).reshape(-1, 1) #apply noise
+    x_kp1 = A @ x_k + B @ u_kp1 + w_k #solve system dynamics
+    return x_kp1
+
+def measurement(C, Sigma_y, x_k, rng):
+    v_k = rng.multivariate_normal(mean=np.zeros(x_k.shape[0]), cov=Sigma_y).reshape(-1, 1) #apply noise
+    y_k = C @ x_k + v_k #solve measurement equation
+    return y_k
+
+seed = 0
+rng = np.random.default_rng(seed)
+
+print(np.mean(x_0))
+
+step1 = dynamics(A,B, Sigma_x, x_0, np.array([[m*g/2],[m*g/2]]), rng)  # hover input
+print("State after one step of hovering:", step1.reshape(-1))
+
+def LQR(A,B,Q_x,Q_u, x, rng):
+    P = solve_discrete_are(A, B, Q_x, Q_u)
+    K = np.linalg.inv(Q_u + B.T @ P @ B) @ (B.T @ P @ A)
+    u = -K @ x
+    return u
+
+LQR_input = LQR(A,B,Q_x,Q_u, step1, rng)
+
+print("LQR control input for the state after one step of hovering:", LQR_input.reshape(-1))
