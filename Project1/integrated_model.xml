@@ -203,8 +203,8 @@
                     <geom class="collision" size="0.06" pos="0 0 0.001"/>
                     <site pos="0 0 0.045" name="attachment_site"/>
                     <!-- Gripper center site for positioning -->
-                    <geom class="visual" type="sphere" size="0.005" pos="0 0 0.35" rgba="1 0 1 1"/>
-                    <site name="gripper_center" pos="0 0 0.35" size="0.5" rgba="1 0 1 1"/>
+                    <!--geom class="visual" type="sphere" size="0.005" pos="0 0 0.35" rgba="1 0 1 1"-->
+                    
                     
                     <!-- Robotiq 2f85 Gripper mounted on attachment_site -->
                     <body name="gripper_base_mount" pos="0 0 0.045" childclass="2f85">
@@ -287,6 +287,7 @@
                         </body>
 
                       </body>
+                    <site name="gripper_center" pos="0 0 0" size="0.025" rgba="1 0 1 1"/>
                     </body>
             
                     
@@ -319,7 +320,7 @@
         
     
     <!-- Box/Door Assembly (floating in zero gravity, positioned closer to robot) -->
-    <body name="box_door_assembly" pos="0.0 0.4 1.2" quat="0.0 1.0 1.0 0">
+    <body name="box_door_assembly" pos="0.0 0.7 1.2" quat="0.0 1.0 1.0 0">
       <freejoint name="assembly_freejoint"/>
       
       <!-- Base Box -->
@@ -339,6 +340,7 @@
           <!-- Z-axis (blue) -->
           <geom name="frame_z_axis" type="capsule" size="0.005 0.1" pos="0 0 0.1" rgba="0 0 1 0.8" 
                 contype="0" conaffinity="0"/>
+        <site name="door_handle_site" pos="0 0 0" size="0.02" rgba="1 1 0 1"/>
         </body>
     
         <!-- Hinged Door -->
@@ -352,7 +354,7 @@
           <geom name="door_geom" type="mesh" mesh="Door" material="mat_door" contype="1" conaffinity="1" friction="0.7 0.1 0.1"/>
           <inertial pos="0 0 0" mass="0.2" diaginertia="0.02 0.02 0.02"/>
         </body>
-        <site name="door_handle_site" pos="0.075 -0.02 0.165" size="0.02" rgba="1 1 0 1"/>
+        
       </body>
     </body>
         

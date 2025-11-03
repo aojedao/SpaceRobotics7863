@@ -248,8 +248,8 @@ class IntegratedZeroGravitySimulation:
             # Insert gripper after the attachment site
             gripper_xml = '''
                     <!-- Gripper center site for positioning -->
-                    <geom class="visual" type="sphere" size="0.005" pos="0 0 0.35" rgba="1 0 1 1"/>
-                    <site name="gripper_center" pos="0 0 0.35" size="0.5" rgba="1 0 1 1"/>
+                    <!--geom class="visual" type="sphere" size="0.005" pos="0 0 0.35" rgba="1 0 1 1"-->
+                    
                     
                     <!-- Robotiq 2f85 Gripper mounted on attachment_site -->
                     <body name="gripper_base_mount" pos="0 0 0.045" childclass="2f85">
@@ -332,6 +332,7 @@ class IntegratedZeroGravitySimulation:
                         </body>
 
                       </body>
+                    <site name="gripper_center" pos="0 0 0" size="0.025" rgba="1 0 1 1"/>
                     </body>
             '''
             
@@ -345,7 +346,7 @@ class IntegratedZeroGravitySimulation:
         box_door_assembly = '''
     
     <!-- Box/Door Assembly (floating in zero gravity, positioned closer to robot) -->
-    <body name="box_door_assembly" pos="0.0 0.4 1.2" quat="0.0 1.0 1.0 0">
+    <body name="box_door_assembly" pos="0.0 0.7 1.2" quat="0.0 1.0 1.0 0">
       <freejoint name="assembly_freejoint"/>
       
       <!-- Base Box -->
@@ -365,6 +366,7 @@ class IntegratedZeroGravitySimulation:
           <!-- Z-axis (blue) -->
           <geom name="frame_z_axis" type="capsule" size="0.005 0.1" pos="0 0 0.1" rgba="0 0 1 0.8" 
                 contype="0" conaffinity="0"/>
+        <site name="door_handle_site" pos="0 0 0" size="0.02" rgba="1 1 0 1"/>
         </body>
     
         <!-- Hinged Door -->
@@ -378,7 +380,7 @@ class IntegratedZeroGravitySimulation:
           <geom name="door_geom" type="mesh" mesh="Door" material="mat_door" contype="1" conaffinity="1" friction="0.7 0.1 0.1"/>
           <inertial pos="0 0 0" mass="0.2" diaginertia="0.02 0.02 0.02"/>
         </body>
-        <site name="door_handle_site" pos="0.075 -0.02 0.165" size="0.02" rgba="1 1 0 1"/>
+        
       </body>
     </body>
         '''
@@ -514,10 +516,10 @@ class IntegratedZeroGravitySimulation:
         if handle_site_id >= 0:
             self.target_position = self.data.site_xpos[handle_site_id]
         else:
-            self.target_position = np.array([1.3, 0.5, 0.5])
+            self.target_position = np.array([0.3, 0.5, 0.5])
         
         # Get target orientation from box using consistent quaternion approach
-        box_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "box_door_assembly")
+        box_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "door_handle_site")
         if box_id >= 0:
             target_quat = np.array([-1, 0, -1, 0]) * self.data.xquat[box_id].copy()
             # Check for valid quaternion (non-zero norm)
@@ -537,7 +539,12 @@ class IntegratedZeroGravitySimulation:
         current_angular_vel = J_rot @ current_joint_vel  # Angular velocity in world frame
         
         # 2. Calculate position error
-        position_error = self.target_position - current_pos
+        position_error = self.target_position - current_pos + np.array([-0.15, 0.15, -0.25])  # Slight Z offset for better approach
+        
+        #RotationCorrecter=np.array([[1,  0,  0],[ 0,  0,  -1],[ 0,  1, 0]])
+        RotationCorrecter=np.array([[0,  -1,  1],[ 0,  0,  -1],[ -1,  0, 0]])
+        #RotationCorrecter=Rotation.from_euler('xyz', [0, 180, 0],degrees=True)
+        target_orient_mat = RotationCorrecter @ target_orient_mat
         
         # 3. Calculate orientation error using rotation matrices (fixed direction)
         R_error = current_orient_mat.T @ target_orient_mat
@@ -551,7 +558,9 @@ class IntegratedZeroGravitySimulation:
         
         # 4. Calculate angular velocity error
         target_angular_vel = self.data.qvel[3:6] if self.model.nv > 6 else np.zeros(3)
-        angular_vel_error = target_angular_vel - current_angular_vel
+        print("Target Angular Velocity:", target_angular_vel)
+        #angular_vel_error = target_angular_vel - current_angular_vel
+        angular_vel_error = orientation_error
         
         # 5. Get Jacobian (position part only, 3x7)
         J = self.compute_jacobian()
@@ -560,10 +569,13 @@ class IntegratedZeroGravitySimulation:
         # 6. Controller gains (velocity control - enhanced Z control and proper orientation)
         K_pos = np.diag([8.2, 10.2, 7.0]) * 1.0         # Position velocity gains
         K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.05    # Angular velocity damping gain matrix
+        K_orient_error= np.diag([5.0, 5.0, 0.0]) * 1.5    # Orientation error gain matrix
 
         # 7. Compute desired Cartesian velocities (PD control in Cartesian space)
         desired_position_velocity = K_pos @ position_error
-        desired_angular_velocity = K_angular_vel @ angular_vel_error
+
+        angular_vel_err = current_angular_vel - target_angular_vel
+        desired_angular_velocity = (K_orient_error @ orientation_error) - (K_angular_vel @ angular_vel_err)
         
         # Combine position and angular velocities for 6DOF control
         desired_cartesian_velocity = np.concatenate([desired_position_velocity, desired_angular_velocity])
@@ -586,7 +598,7 @@ class IntegratedZeroGravitySimulation:
             self.data.ctrl[len(joint_velocities_clipped):] = 0.0
         
         # 10. Store target orientation for frame visualization
-        self.current_target_orientation = target_orient_mat.copy()
+        self.current_target_orientation = target_orient_mat
         
         # 11. Collect data for plotting
         self.collect_controller_data(current_pos, current_orient_mat, target_orient_mat, 
