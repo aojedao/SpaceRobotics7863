@@ -1,0 +1,151 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam classBackgroundColor #F8F8FF
+skinparam classBorderColor #4169E1
+
+title **KUKA iiwa14 Y-Axis Alignment Controller - Class Architecture**
+
+class IntegratedZeroGravitySimulation {
+    -model: mujoco.MjModel
+    -data: mujoco.MjData
+    -target_position: np.array[3]
+    -controller_enabled: bool
+    -gripper_target: float
+    
+    **ISS Orbital Parameters**
+    -iss_altitude: 408000.0
+    -iss_orbital_period: 5580.0
+    -orbital_radius_scaled: 60.0
+    -orbital_velocity_scaled: 3.0
+    
+    **Controller Parameters**
+    -K_pos: np.diag([8.2, 10.2, 7.0])
+    -K_angular_vel: np.diag([2.0, 2.0, 2.0])
+    -lambda_damping: 0.25
+    -max_velocity: 4.0
+    
+    **Data Collection**
+    -current_position_data: deque
+    -current_euler_data: deque
+    -target_euler_data: deque
+    -orientation_error_euler_data: deque
+    -cumulative_current_euler: np.array[3]
+    -cumulative_target_euler: np.array[3]
+    
+    +__init__(iiwa_model_path, door_model_path)
+    +create_integrated_model()
+    +setup_control_parameters()
+    +run_simulation(duration)
+    +position_controller()
+    +get_end_effector_position()
+    +compute_jacobian()
+    +collect_controller_data()
+    +plot_controller_data()
+    +plot_error_analysis()
+}
+
+package "**Controller Components**" #LightBlue {
+    class PositionController {
+        +calculate_position_error()
+        +calculate_orientation_error()
+        +compute_desired_velocities()
+        +apply_y_axis_only_control()
+    }
+    
+    class JacobianController {
+        +compute_jacobian_matrix()
+        +damped_least_squares_inverse()
+        +null_space_projection()
+    }
+    
+    class OrientationTracker {
+        +quaternion_to_euler()
+        +unwrap_euler_angles()
+        +track_continuous_angles()
+        +zero_roll_yaw_errors()
+    }
+}
+
+package "**Physics & Environment**" #LightGreen {
+    class ISSOrbitMechanics {
+        +setup_iss_orbital_parameters()
+        +apply_iss_orbital_forces()
+        +calculate_centripetal_force()
+        +calculate_coriolis_effects()
+    }
+    
+    class MuJoCoPhysics {
+        +load_model()
+        +step_simulation()
+        +apply_forces()
+        +handle_collisions()
+    }
+}
+
+package "**Data Analysis**" #LightYellow {
+    class DataCollector {
+        +collect_controller_data()
+        +store_continuous_euler()
+        +track_performance_metrics()
+    }
+    
+    class Visualizer {
+        +plot_controller_data()
+        +plot_error_analysis()
+        +generate_performance_plots()
+        +save_analysis_images()
+    }
+}
+
+package "**Model Components**" #LightCoral {
+    class KUKAModel {
+        +iiwa14.xml
+        +7 DOF arm joints
+        +collision properties
+        +joint limits
+    }
+    
+    class RobotiqGripper {
+        +2F85 gripper
+        +tendon system
+        +finger actuators
+    }
+    
+    class DoorAssembly {
+        +box_door_assembly
+        +hinge joint
+        +collision geometry
+    }
+}
+
+' Relationships
+IntegratedZeroGravitySimulation *-- PositionController
+IntegratedZeroGravitySimulation *-- JacobianController
+IntegratedZeroGravitySimulation *-- OrientationTracker
+IntegratedZeroGravitySimulation *-- ISSOrbitMechanics
+IntegratedZeroGravitySimulation *-- MuJoCoPhysics
+IntegratedZeroGravitySimulation *-- DataCollector
+IntegratedZeroGravitySimulation *-- Visualizer
+
+IntegratedZeroGravitySimulation --> KUKAModel
+IntegratedZeroGravitySimulation --> RobotiqGripper  
+IntegratedZeroGravitySimulation --> DoorAssembly
+
+note top of IntegratedZeroGravitySimulation
+    **Y-AXIS ALIGNMENT CONTROLLER**
+    • Only controls pitch (Y-axis) orientation
+    • Ignores roll (X) and yaw (Z) axes
+    • Uses continuous Euler angle tracking
+    • Implements ISS orbital mechanics
+    • Redundant manipulator control
+end note
+
+note bottom of OrientationTracker
+    **KEY FEATURE: Y-AXIS ONLY**
+    orientation_error_euler_raw[0] = 0.0  // Roll ignored
+    orientation_error_euler_raw[1] = -pitch_error  // Pitch controlled
+    orientation_error_euler_raw[2] = 0.0  // Yaw ignored
+end note
+
+@enduml

@@ -1,0 +1,88 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam classBackgroundColor #F8F8FF
+skinparam classBorderColor #4169E1
+skinparam activityBackgroundColor #E6F3FF
+skinparam activityBorderColor #4169E1
+skinparam noteBackgroundColor #FFFACD
+
+title **KUKA iiwa14 Y-Axis Alignment Controller Architecture**\nIntegrated Zero-Gravity Simulation with ISS Orbital Mechanics
+
+start
+
+partition "**INITIALIZATION PHASE**" #LightBlue {
+    :Load KUKA iiwa14.xml Model;
+    :Create Integrated Model\n(Add Robotiq Gripper + Door);
+    :Initialize MuJoCo Physics Engine;
+    :Setup ISS Orbital Parameters\n• 408km altitude\n• 93min period\n• Gentle forces (0.01x);
+    :Initialize Controller Parameters\n• K_pos = [8.2, 10.2, 7.0]\n• K_angular_vel = 2.0\n• λ_damping = 0.25;
+    :Setup Data Collection\n• Position/Orientation tracking\n• Continuous Euler unwrapping\n• Error analysis buffers;
+}
+
+partition "**MAIN SIMULATION LOOP**" #LightGreen {
+    :Start MuJoCo Viewer;
+    
+    repeat
+        partition "**CONTROLLER EXECUTION**" #LightYellow {
+            :Get End-Effector State\n• Current position (3D)\n• Current orientation matrix;
+            
+            :Get Target State\n• Box/door position\n• Box/door orientation;
+            
+            :Calculate Position Error\nΔp = target_pos - current_pos;
+            
+            :Calculate Y-Axis Alignment Error\n• Convert orientations to Euler\n• Extract pitch (Y-axis) only\n• Zero out roll/yaw errors;
+            
+            note right
+                **Y-AXIS ONLY CONTROL**
+                • Roll (X): Ignored (set to 0)
+                • Pitch (Y): Controlled
+                • Yaw (Z): Ignored (set to 0)
+            end note
+            
+            :Calculate Angular Velocity Error\nΔω = target_ω - current_ω;
+            
+            :Compute Jacobian Matrix J (6×7)\n• Position Jacobian (3×7)\n• Orientation Jacobian (3×7);
+            
+            :Calculate Desired Velocities\n• Position: v_des = K_pos × Δp\n• Y-Axis only: ω_des[1] = K_ω × Δω[1]\n• ω_des[0] = ω_des[2] = 0;
+            
+            :Redundant Manipulator Control\n• Damped least squares\n• Null space projection\n• Joint velocity = J⁺ × [v_des; ω_des];
+            
+            :Apply Velocity Commands\n• Clip to max velocity (4.0 rad/s)\n• Send to MuJoCo actuators;
+        }
+        
+        partition "**PHYSICS SIMULATION**" #LightCyan {
+            :Apply ISS Orbital Forces\n• Centripetal force\n• Coriolis effects\n• Gentle scaling (0.01x);
+            
+            :MuJoCo Physics Step\n• Forward dynamics\n• Collision detection\n• Constraint solving;
+            
+            :Update Viewer Display;
+        }
+        
+        partition "**DATA COLLECTION**" #LightPink {
+            :Collect Controller Data\n• Position/orientation states\n• Error calculations\n• Joint values/velocities;
+            
+            :Continuous Angle Tracking\n• Unwrap Euler angles\n• Prevent 180°/90° jumps\n• Store continuous data;
+            
+            if (Every 60 steps?) then (yes)
+                :Print Status\n• Position error\n• Y-axis alignment error\n• Controller state;
+            endif
+        }
+        
+        :Check Duration Limit;
+        
+    repeat while (Viewer running AND\nDuration not exceeded?)
+}
+
+partition "**ANALYSIS & VISUALIZATION**" #LightSalmon {
+    :Generate Performance Plots\n• Position vs Time\n• Y-axis alignment vs Time\n• Joint values\n• Velocity commands;
+    
+    :Generate Error Analysis\n• Position error magnitude\n• Y-axis alignment error\n• Performance statistics;
+    
+    :Save Results\n• integrated_controller_performance_analysis.png\n• controller_error_analysis.png;
+}
+
+:Cleanup Resources;
+stop
+
+@enduml
