@@ -396,6 +396,8 @@
     <!-- Robotiq 2f85 gripper actuator -->
     <general class="2f85" name="fingers_actuator" tendon="split" forcerange="-5 5" ctrlrange="0 255"
       gainprm="0.3137255 0 0" biasprm="0 -100 -10"/>
+    <!-- Manual joint7 actuator (exposed in viewer as a slider for manual torque input) -->
+    <motor name="manual_joint7" joint="joint7" gear="1" ctrlrange="-200 200"/>
   </actuator>
 
   <!-- Equality constraints for gripper mechanism -->

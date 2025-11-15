@@ -17,12 +17,21 @@ import matplotlib.pyplot as plt
 import os
 from scipy.spatial.transform import Rotation
 from collections import deque
+from controller import ControllerFactory
 
 class IntegratedZeroGravitySimulation:
     def __init__(self, 
                  iiwa_model_path="kuka_iiwa_14/iiwa14.xml",
-                 door_model_path="door_hinge_model.xml"):
-        """Initialize the integrated simulation using original iiwa14 + extensions"""
+                 door_model_path="door_hinge_model.xml",
+                 controller_type='position'):
+        """
+        Initialize the integrated simulation using original iiwa14 + extensions
+        
+        Args:
+            iiwa_model_path: Path to KUKA iiwa14 model
+            door_model_path: Path to door model
+            controller_type: Type of controller to use ('position' or 'torque_balancing')
+        """
         
         # Check if model files exist
         if not os.path.exists(iiwa_model_path):
@@ -37,19 +46,22 @@ class IntegratedZeroGravitySimulation:
         # Initialize control parameters
         self.setup_control_parameters()
         
+        # Initialize controller
+        self.controller_type = controller_type
+        self.controller = ControllerFactory.create_controller(
+            controller_type,
+            self.model,
+            self.data,
+            kp_position=100.0,
+            kd_position=20.0,
+            max_joint_velocity=2.0,
+            torque_balance_gain=0.5
+        )
+        
         # Movement step sizes
         self.position_step = 0.02  # meters
         self.position_step_fast = 0.05  # faster movement
         self.impulse_strength = 2.0  # impulse strength for box movement
-        
-        # Controller parameters (tune these for your controller)
-        self.kp_position = 100.0    # Proportional gain for position control
-        self.kd_position = 20.0     # Derivative gain for position control
-        self.max_joint_velocity = 2.0  # Maximum allowed velocity per joint (rad/s)
-        
-        # Controller state variables
-        self.previous_position_error = np.zeros(3)  # For derivative control
-        self.controller_enabled = True  # Enable/disable automatic controller (default: ON)
         
         # Other control state
         self.gripper_target = 0.0  # Robotiq 2f85 gripper (0=open, 255=closed)
@@ -67,23 +79,31 @@ class IntegratedZeroGravitySimulation:
         self.joint_velocities_data = deque(maxlen=self.max_data_points)  # Joint velocities
         self.linear_velocity_data = deque(maxlen=self.max_data_points)   # End effector linear velocity
         self.angular_velocity_data = deque(maxlen=self.max_data_points)  # End effector angular velocity
+        self.shear_force_data = deque(maxlen=self.max_data_points)  # Base shear force (for torque controller)
+        self.torque_data = deque(maxlen=self.max_data_points)  # Joint torques (for torque controller)
         self.simulation_start_time = None
         
         print("\n" + "="*70)
         print("🚀 INTEGRATED ZERO-GRAVITY PHYSICS SIMULATION")
         print("🤖 Original KUKA iiwa14 + Robotiq 2F85 Gripper + Box/Door Model")
         print("="*70)
-        print("INTEGRATED CONTROLLER FRAMEWORK:")
+        print("CONTROLLER FRAMEWORK:")
+        print(f"  • Active Controller: {controller_type.upper()}")
         print("  • Original iiwa14.xml collision and physics properties")
         print("  • 6DOF Cartesian space control with quaternion orientation")
         print("  • Redundant manipulator control with null space projection")
         print("  • Damped least squares to avoid singularities")
         print("  • Angular velocity damping for orientation stability")
         print("  • Comprehensive real-time data collection and analysis")
+        print("AVAILABLE CONTROLLERS:")
+        for ctrl in ControllerFactory.get_available_controllers():
+            marker = "→" if ctrl == controller_type else " "
+            print(f"  {marker} {ctrl}")
         print("USAGE:")
-        print("  python integrated_simulation.py                 # Run indefinitely")
-        print("  python integrated_simulation.py --duration 10   # Run for 10 seconds")
-        print("  python integrated_simulation.py --plot-only     # Generate plots only")
+        print("  python integrated_simulation.py                           # Run with position controller")
+        print("  python integrated_simulation.py --controller torque_balancing  # Run with torque-balancing")
+        print("  python integrated_simulation.py --duration 10              # Run for 10 seconds")
+        print("  python integrated_simulation.py --plot-only                # Generate plots only")
         print("="*70)
 
     def create_integrated_model(self, iiwa_model_path, door_model_path):
@@ -410,6 +430,8 @@ class IntegratedZeroGravitySimulation:
     <!-- Robotiq 2f85 gripper actuator -->
     <general class="2f85" name="fingers_actuator" tendon="split" forcerange="-5 5" ctrlrange="0 255"
       gainprm="0.3137255 0 0" biasprm="0 -100 -10"/>
+    <!-- Manual joint7 actuator (exposed in viewer as a slider for manual torque input) -->
+    <motor name="manual_joint7" joint="joint7" gear="1" ctrlrange="-200 200"/>
   </actuator>
 
   <!-- Equality constraints for gripper mechanism -->
@@ -444,14 +466,14 @@ class IntegratedZeroGravitySimulation:
         """Setup joint names and control parameters using original iiwa structure"""
         
         # Robot arm joints (from original iiwa14)
-        self.arm_joint_names = [
+        arm_joint_names = [
             "joint1", "joint2", "joint3", "joint4", 
             "joint5", "joint6", "joint7"
         ]
         
         # Get joint IDs for applying forces/torques directly
         self.arm_joint_ids = []
-        for name in self.arm_joint_names:
+        for name in arm_joint_names:
             joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
             self.arm_joint_ids.append(joint_id)
         
@@ -471,150 +493,33 @@ class IntegratedZeroGravitySimulation:
         print(f"✓ Found gripper actuator: {'Yes' if self.gripper_actuator_id >= 0 else 'No'}")
         print(f"✓ Found door joint: {'Yes' if self.door_joint_id >= 0 else 'No'}")
 
+    def step_controller(self):
+        """Step the controller to compute and apply control commands"""
+        control_data = self.controller.compute_control()
+        
+        if control_data is not None:
+            self.collect_controller_data(control_data)
+
     def get_end_effector_position(self):
         """Get current end-effector position"""
-        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "gripper_center")
-        return self.data.site_xpos[site_id]
+        return self.controller.get_end_effector_position()
 
-    def compute_jacobian(self):
-        """Compute the Jacobian matrix for the robot arm using original iiwa structure"""
-        # Get end effector site ID
-        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "gripper_center")
-        
-        if site_id >= 0:
-            # Allocate Jacobian matrices
-            jac_pos = np.zeros((3, self.model.nv))  # Position Jacobian
-            jac_rot = np.zeros((3, self.model.nv))  # Rotation Jacobian
-            
-            # Compute Jacobians
-            mujoco.mj_jacSite(self.model, self.data, jac_pos, jac_rot, site_id)
-            
-            # Combine position and rotation Jacobians for 6DOF control
-            jacobian = np.vstack([jac_pos, jac_rot])
-            
-            # Extract only the arm joints (first 7 DOF for iiwa14)
-            return jacobian[:, :7]
-        else:
-            # Return identity if site not found
-            return np.eye(6, 7)
-    
-    def position_controller(self):
-        """Enhanced position controller using original iiwa14 structure"""
-        
-        if not self.controller_enabled:
-            return
-            
-        # 1. Get current position and orientation
-        current_pos = self.get_end_effector_position()
-        
-        # Get current end effector orientation as rotation matrix
-        orient_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "gripper_center")
-        current_orient_mat = self.data.site_xmat[orient_id].reshape(3,3)
-
-        # Get target position from door handle site (consistent approach)
-        handle_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, 'door_handle_site')
-        if handle_site_id >= 0:
-            self.target_position = self.data.site_xpos[handle_site_id]
-        else:
-            self.target_position = np.array([0.3, 0.5, 0.5])
-        
-        # Get target orientation from box using consistent quaternion approach
-        box_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "door_handle_site")
-        if box_id >= 0:
-            target_quat = np.array([-1, 0, -1, 0]) * self.data.xquat[box_id].copy()
-            # Check for valid quaternion (non-zero norm)
-            if np.linalg.norm(target_quat) > 1e-6:
-                target_orient_mat = Rotation.from_quat(target_quat[[1, 2, 3, 0]]).as_matrix()
-            else:
-                target_orient_mat = np.eye(3)
-        else:
-            target_orient_mat = np.eye(3)
-
-        # Get current joint velocities for the arm (first 7 joints)
-        current_joint_vel = self.data.qvel[:7]  # First 7 DOF are arm joints
-        
-        # Get current angular velocity of end effector in world frame
-        J_full = self.compute_jacobian()  # This gives us 6x7 jacobian
-        J_rot = J_full[3:6, :7]  # Rotational part of Jacobian
-        current_angular_vel = J_rot @ current_joint_vel  # Angular velocity in world frame
-        
-        # 2. Calculate position error
-        position_error = self.target_position - current_pos + np.array([-0.15, 0.15, -0.25])  # Slight Z offset for better approach
-        
-        #RotationCorrecter=np.array([[1,  0,  0],[ 0,  0,  -1],[ 0,  1, 0]])
-        RotationCorrecter=np.array([[0,  -1,  1],[ 0,  0,  -1],[ -1,  0, 0]])
-        #RotationCorrecter=Rotation.from_euler('xyz', [0, 180, 0],degrees=True)
-        target_orient_mat = RotationCorrecter @ target_orient_mat
-        
-        # 3. Calculate orientation error using rotation matrices (fixed direction)
-        R_error = current_orient_mat.T @ target_orient_mat
-        
-        # Convert rotation matrix error to axis-angle representation
-        orientation_error = np.array([
-            R_error[2, 1] - R_error[1, 2],
-            R_error[0, 2] - R_error[2, 0],
-            R_error[1, 0] - R_error[0, 1]
-        ]) * 0.5
-        
-        # 4. Calculate angular velocity error
-        target_angular_vel = self.data.qvel[3:6] if self.model.nv > 6 else np.zeros(3)
-        print("Target Angular Velocity:", target_angular_vel)
-        #angular_vel_error = target_angular_vel - current_angular_vel
-        angular_vel_error = orientation_error
-        
-        # 5. Get Jacobian (position part only, 3x7)
-        J = self.compute_jacobian()
-        J_pos = J[:3, :7]  # Take only position Jacobian for arm joints
-        
-        # 6. Controller gains (velocity control - enhanced Z control and proper orientation)
-        K_pos = np.diag([8.2, 10.2, 7.0]) * 1.0         # Position velocity gains
-        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.05    # Angular velocity damping gain matrix
-        K_orient_error= np.diag([5.0, 5.0, 0.0]) * 1.5    # Orientation error gain matrix
-
-        # 7. Compute desired Cartesian velocities (PD control in Cartesian space)
-        desired_position_velocity = K_pos @ position_error
-
-        angular_vel_err = current_angular_vel - target_angular_vel
-        desired_angular_velocity = (K_orient_error @ orientation_error) - (K_angular_vel @ angular_vel_err)
-        
-        # Combine position and angular velocities for 6DOF control
-        desired_cartesian_velocity = np.concatenate([desired_position_velocity, desired_angular_velocity])
-        
-        # 8. Map to joint space using redundant manipulator control with null space projection
-        try:
-            lambda_damping = 0.25  # Damping factor for numerical stability
-            J_damped_pinv = J.T @ np.linalg.inv(J @ J.T + lambda_damping * np.eye(6))
-            joint_velocities = J_damped_pinv @ desired_cartesian_velocity
-        except np.linalg.LinAlgError:
-            joint_velocities = np.zeros(7)
-        
-        # 9. Apply velocity commands with limits
-        max_velocity = 4.0  # Maximum velocity limit (rad/s)
-        joint_velocities_clipped = np.clip(joint_velocities, -max_velocity, max_velocity)
-        
-        # Set velocity commands directly to ctrl (velocity control)
-        self.data.ctrl[:len(joint_velocities_clipped)] = joint_velocities_clipped
-        if self.model.nu > len(joint_velocities_clipped):
-            self.data.ctrl[len(joint_velocities_clipped):] = 0.0
-        
-        # 10. Store target orientation for frame visualization
-        self.current_target_orientation = target_orient_mat
-        
-        # 11. Collect data for plotting
-        self.collect_controller_data(current_pos, current_orient_mat, target_orient_mat, 
-                                   position_error, orientation_error, current_joint_vel, current_angular_vel)
-        
-        # 12. Update previous error for next iteration
-        self.previous_position_error = position_error.copy()
-
-    def collect_controller_data(self, current_pos, current_orient_mat, target_orient_mat, 
-                              position_error, orientation_error, current_joint_vel, current_angular_vel):
+    def collect_controller_data(self, control_data):
         """Collect comprehensive controller data for analysis"""
         
         if self.simulation_start_time is None:
             self.simulation_start_time = time.time()
         
         current_time = time.time() - self.simulation_start_time
+        
+        # Extract data from control output
+        current_pos = control_data['current_pos']
+        current_orient_mat = control_data['current_orient']
+        target_orient_mat = control_data['target_orient']
+        position_error = control_data['position_error']
+        orientation_error = control_data['orientation_error']
+        current_joint_vel = control_data['current_joint_vel']
+        current_angular_vel = control_data['current_angular_vel']
         
         # Convert rotation matrices to quaternions for storage
         current_quat = Rotation.from_matrix(current_orient_mat).as_quat()  # [x, y, z, w]
@@ -633,7 +538,7 @@ class IntegratedZeroGravitySimulation:
         
         self.time_data.append(current_time)
         self.position_error_data.append(position_error.copy())
-        self.target_position_data.append(self.target_position.copy())
+        self.target_position_data.append(self.controller.target_position.copy())
         self.orientation_error_data.append(orientation_error.copy())
         self.current_position_data.append(current_pos.copy())
         self.current_orientation_data.append(current_quat.copy())
@@ -652,6 +557,12 @@ class IntegratedZeroGravitySimulation:
             linear_vel = np.zeros(3)
         self.linear_velocity_data.append(linear_vel.copy())
         self.angular_velocity_data.append(current_angular_vel.copy())
+        
+        # Store torque-specific data if available
+        if 'shear_force' in control_data:
+            self.shear_force_data.append(control_data['shear_force'])
+        if 'joint_torques' in control_data:
+            self.torque_data.append(control_data['joint_torques'].copy())
 
     def plot_controller_data(self):
         """Generate comprehensive plots of controller performance"""
@@ -661,22 +572,38 @@ class IntegratedZeroGravitySimulation:
             return
         
         print("📊 Generating plots from collected data...")
-        
-        # Convert deques to numpy arrays for plotting
+
+        # Convert deques to numpy arrays for plotting (robust to ragged entries)
+        def safe_stack(dq):
+            try:
+                return np.vstack(dq)
+            except Exception:
+                # fallback: try np.array (may produce object dtype); handle later
+                arr = np.array(dq)
+                if arr.ndim == 1:
+                    # Convert to column vector
+                    return arr.reshape(-1, 1)
+                return arr
+
         time_array = np.array(self.time_data)
-        pos_error_array = np.array(self.position_error_data)
-        target_pos_array = np.array(self.target_position_data)
-        current_pos_array = np.array(self.current_position_data)
-        orient_error_array = np.array(self.orientation_error_data)
-        current_orient_array = np.array(self.current_orientation_data)
-        target_orient_array = np.array(self.target_orientation_data)
-        joint_values_array = np.array(self.joint_values_data)
-        joint_vel_array = np.array(self.joint_velocities_data)
-        linear_vel_array = np.array(self.linear_velocity_data)
-        angular_vel_array = np.array(self.angular_velocity_data)
-        
+        pos_error_array = safe_stack(self.position_error_data)
+        target_pos_array = safe_stack(self.target_position_data)
+        current_pos_array = safe_stack(self.current_position_data)
+        orient_error_array = safe_stack(self.orientation_error_data)
+        current_orient_array = safe_stack(self.current_orientation_data)
+        target_orient_array = safe_stack(self.target_orientation_data)
+        joint_values_array = safe_stack(self.joint_values_data)
+        joint_vel_array = safe_stack(self.joint_velocities_data)
+        linear_vel_array = safe_stack(self.linear_velocity_data)
+        angular_vel_array = safe_stack(self.angular_velocity_data)
+
         # Calculate position error magnitude
-        pos_error_mag = np.linalg.norm(pos_error_array, axis=1)
+        # Ensure pos_error_array has shape (N,3)
+        if pos_error_array.ndim == 1:
+            # if stored as scalar values, convert to column
+            pos_error_mag = np.abs(pos_error_array)
+        else:
+            pos_error_mag = np.linalg.norm(pos_error_array, axis=1)
         
         # Create comprehensive plot with 3x3 subplots
         fig, axes = plt.subplots(3, 3, figsize=(18, 15))
@@ -692,97 +619,122 @@ class IntegratedZeroGravitySimulation:
         axes[0, 0].grid(True)
         
         # Plot 2: Position Error Components
-        axes[0, 1].plot(time_array, pos_error_array[:, 0], 'r-', label='X Error')
-        axes[0, 1].plot(time_array, pos_error_array[:, 1], 'g-', label='Y Error') 
-        axes[0, 1].plot(time_array, pos_error_array[:, 2], 'b-', label='Z Error')
+        if pos_error_array.ndim == 2 and pos_error_array.shape[1] >= 3:
+            axes[0, 1].plot(time_array, pos_error_array[:, 0], 'r-', label='X Error')
+            axes[0, 1].plot(time_array, pos_error_array[:, 1], 'g-', label='Y Error')
+            axes[0, 1].plot(time_array, pos_error_array[:, 2], 'b-', label='Z Error')
+        else:
+            axes[0, 1].plot(time_array, pos_error_mag, 'k-', label='Position Error')
         axes[0, 1].set_xlabel('Time (s)')
         axes[0, 1].set_ylabel('Position Error (m)')
         axes[0, 1].set_title('Position Error Components')
         axes[0, 1].legend()
         axes[0, 1].grid(True)
-        
+
         # Plot 3: Current vs Target Position (3D components)
-        axes[0, 2].plot(time_array, current_pos_array[:, 0], 'r-', label='Current X')
-        axes[0, 2].plot(time_array, target_pos_array[:, 0], 'r--', alpha=0.7, label='Target X')
-        axes[0, 2].plot(time_array, current_pos_array[:, 1], 'g-', label='Current Y')
-        axes[0, 2].plot(time_array, target_pos_array[:, 1], 'g--', alpha=0.7, label='Target Y')
-        axes[0, 2].plot(time_array, current_pos_array[:, 2], 'b-', label='Current Z')
-        axes[0, 2].plot(time_array, target_pos_array[:, 2], 'b--', alpha=0.7, label='Target Z')
+        if (current_pos_array.ndim == 2 and current_pos_array.shape[1] >= 3 and
+                target_pos_array.ndim == 2 and target_pos_array.shape[1] >= 3):
+            axes[0, 2].plot(time_array, current_pos_array[:, 0], 'r-', label='Current X')
+            axes[0, 2].plot(time_array, target_pos_array[:, 0], 'r--', alpha=0.7, label='Target X')
+            axes[0, 2].plot(time_array, current_pos_array[:, 1], 'g-', label='Current Y')
+            axes[0, 2].plot(time_array, target_pos_array[:, 1], 'g--', alpha=0.7, label='Target Y')
+            axes[0, 2].plot(time_array, current_pos_array[:, 2], 'b-', label='Current Z')
+            axes[0, 2].plot(time_array, target_pos_array[:, 2], 'b--', alpha=0.7, label='Target Z')
+        else:
+            axes[0, 2].plot(time_array, pos_error_mag, 'k-', label='Position Error')
         axes[0, 2].set_xlabel('Time (s)')
         axes[0, 2].set_ylabel('Position (m)')
         axes[0, 2].set_title('Current vs Target Position')
         axes[0, 2].legend()
         axes[0, 2].grid(True)
-        
-        # Plot 4: Orientation Error Components  
-        axes[1, 0].plot(time_array, orient_error_array[:, 0], 'r-', label='X Rotation Error')
-        axes[1, 0].plot(time_array, orient_error_array[:, 1], 'g-', label='Y Rotation Error')
-        axes[1, 0].plot(time_array, orient_error_array[:, 2], 'b-', label='Z Rotation Error')
+
+        # Plot 4: Orientation Error Components
+        if orient_error_array.ndim == 2 and orient_error_array.shape[1] >= 3:
+            axes[1, 0].plot(time_array, orient_error_array[:, 0], 'r-', label='X Rotation Error')
+            axes[1, 0].plot(time_array, orient_error_array[:, 1], 'g-', label='Y Rotation Error')
+            axes[1, 0].plot(time_array, orient_error_array[:, 2], 'b-', label='Z Rotation Error')
+        else:
+            axes[1, 0].plot(time_array, np.zeros_like(time_array), 'k-', label='Orient Error')
         axes[1, 0].set_xlabel('Time (s)')
         axes[1, 0].set_ylabel('Orientation Error (rad)')
         axes[1, 0].set_title('Orientation Error Components')
         axes[1, 0].legend()
         axes[1, 0].grid(True)
-        
+
         # Plot 5: Current vs Target Orientation (Quaternions) - All 4 components
-        axes[1, 1].plot(time_array, current_orient_array[:, 0], 'r-', label='Current qx')
-        axes[1, 1].plot(time_array, target_orient_array[:, 0], 'r--', alpha=0.7, label='Target qx')
-        axes[1, 1].plot(time_array, current_orient_array[:, 1], 'g-', label='Current qy')
-        axes[1, 1].plot(time_array, target_orient_array[:, 1], 'g--', alpha=0.7, label='Target qy')
-        axes[1, 1].plot(time_array, current_orient_array[:, 2], 'b-', label='Current qz')
-        axes[1, 1].plot(time_array, target_orient_array[:, 2], 'b--', alpha=0.7, label='Target qz')
-        axes[1, 1].plot(time_array, current_orient_array[:, 3], 'm-', label='Current qw')
-        axes[1, 1].plot(time_array, target_orient_array[:, 3], 'm--', alpha=0.7, label='Target qw')
+        if (current_orient_array.ndim == 2 and current_orient_array.shape[1] >= 4 and
+                target_orient_array.ndim == 2 and target_orient_array.shape[1] >= 4):
+            axes[1, 1].plot(time_array, current_orient_array[:, 0], 'r-', label='Current qx')
+            axes[1, 1].plot(time_array, target_orient_array[:, 0], 'r--', alpha=0.7, label='Target qx')
+            axes[1, 1].plot(time_array, current_orient_array[:, 1], 'g-', label='Current qy')
+            axes[1, 1].plot(time_array, target_orient_array[:, 1], 'g--', alpha=0.7, label='Target qy')
+            axes[1, 1].plot(time_array, current_orient_array[:, 2], 'b-', label='Current qz')
+            axes[1, 1].plot(time_array, target_orient_array[:, 2], 'b--', alpha=0.7, label='Target qz')
+            axes[1, 1].plot(time_array, current_orient_array[:, 3], 'm-', label='Current qw')
+            axes[1, 1].plot(time_array, target_orient_array[:, 3], 'm--', alpha=0.7, label='Target qw')
+        else:
+            axes[1, 1].plot(time_array, np.zeros_like(time_array), 'k-', label='Orientation')
         axes[1, 1].set_xlabel('Time (s)')
         axes[1, 1].set_ylabel('Quaternion Components')
         axes[1, 1].set_title('Current vs Target Orientation (Quaternions)')
         axes[1, 1].legend()
         axes[1, 1].grid(True)
-        
+
         # Plot 6: Joint Values
         axes[1, 2].clear()
-        for i in range(min(7, joint_values_array.shape[1])):
-            axes[1, 2].plot(time_array, joint_values_array[:, i], label=f'Joint {i+1}')
+        if joint_values_array.ndim == 2:
+            for i in range(min(7, joint_values_array.shape[1])):
+                axes[1, 2].plot(time_array, joint_values_array[:, i], label=f'Joint {i+1}')
+        else:
+            axes[1, 2].plot(time_array, np.zeros_like(time_array), label='Joint Values')
         axes[1, 2].set_xlabel('Time (s)')
         axes[1, 2].set_ylabel('Joint Angles (rad)')
         axes[1, 2].set_title('Joint Values')
         axes[1, 2].legend()
         axes[1, 2].grid(True)
-        
+
         # Plot 7: Joint Velocities
         axes[2, 0].clear()
-        for i in range(min(7, joint_vel_array.shape[1])):
-            axes[2, 0].plot(time_array, joint_vel_array[:, i], label=f'Joint {i+1}')
+        if joint_vel_array.ndim == 2:
+            for i in range(min(7, joint_vel_array.shape[1])):
+                axes[2, 0].plot(time_array, joint_vel_array[:, i], label=f'Joint {i+1}')
+        else:
+            axes[2, 0].plot(time_array, np.zeros_like(time_array), label='Joint Velocities')
         axes[2, 0].set_xlabel('Time (s)')
         axes[2, 0].set_ylabel('Joint Velocities (rad/s)')
         axes[2, 0].set_title('Joint Velocities')
         axes[2, 0].legend()
         axes[2, 0].grid(True)
-        
+
         # Plot 8: End Effector Linear Velocity
-        axes[2, 1].plot(time_array, linear_vel_array[:, 0], 'r-', label='Vx')
-        axes[2, 1].plot(time_array, linear_vel_array[:, 1], 'g-', label='Vy')
-        axes[2, 1].plot(time_array, linear_vel_array[:, 2], 'b-', label='Vz')
+        if linear_vel_array.ndim == 2 and linear_vel_array.shape[1] >= 3:
+            axes[2, 1].plot(time_array, linear_vel_array[:, 0], 'r-', label='Vx')
+            axes[2, 1].plot(time_array, linear_vel_array[:, 1], 'g-', label='Vy')
+            axes[2, 1].plot(time_array, linear_vel_array[:, 2], 'b-', label='Vz')
+        else:
+            axes[2, 1].plot(time_array, np.zeros_like(time_array), label='Linear Vel')
         axes[2, 1].set_xlabel('Time (s)')
         axes[2, 1].set_ylabel('Linear Velocity (m/s)')
         axes[2, 1].set_title('End Effector Linear Velocity')
         axes[2, 1].legend()
         axes[2, 1].grid(True)
-        
         # Plot 9: End Effector Angular Velocity
-        axes[2, 2].plot(time_array, angular_vel_array[:, 0], 'r-', label='ωx')
-        axes[2, 2].plot(time_array, angular_vel_array[:, 1], 'g-', label='ωy')
-        axes[2, 2].plot(time_array, angular_vel_array[:, 2], 'b-', label='ωz')
+        if angular_vel_array.ndim == 2 and angular_vel_array.shape[1] >= 3:
+            axes[2, 2].plot(time_array, angular_vel_array[:, 0], 'r-', label='ωx')
+            axes[2, 2].plot(time_array, angular_vel_array[:, 1], 'g-', label='ωy')
+            axes[2, 2].plot(time_array, angular_vel_array[:, 2], 'b-', label='ωz')
+        else:
+            axes[2, 2].plot(time_array, np.zeros_like(time_array), label='Angular Vel')
         axes[2, 2].set_xlabel('Time (s)')
         axes[2, 2].set_ylabel('Angular Velocity (rad/s)')
         axes[2, 2].set_title('End Effector Angular Velocity')
         axes[2, 2].legend()
         axes[2, 2].grid(True)
-        
+
         plt.tight_layout()
         plt.savefig('integrated_controller_performance_analysis.png', dpi=300, bbox_inches='tight')
         print("📊 Integrated controller analysis saved to 'integrated_controller_performance_analysis.png'!")
-        plt.show()
+        # Don't show plot interactively (would block during simulation)
 
     def run_simulation(self, duration=None):
         """Run the integrated simulation with viewer"""
@@ -808,7 +760,7 @@ class IntegratedZeroGravitySimulation:
                 step_start = time.time()
                 
                 # Run controller
-                self.position_controller()
+                self.step_controller()
                 
                 # Step simulation
                 mujoco.mj_step(self.model, self.data)
@@ -837,8 +789,7 @@ class IntegratedZeroGravitySimulation:
                 if time_until_next_step > 0:
                     time.sleep(time_until_next_step)
         
-        print("👋 Simulation ended")
-        self.plot_controller_data()
+        print("👋 Simulation ended (viewer closed)")
 
 
 def main():
@@ -847,6 +798,9 @@ def main():
     parser = argparse.ArgumentParser(description='Run the integrated zero-gravity simulation')
     parser.add_argument('--duration', '-d', type=float, default=None, 
                         help='Duration to run simulation in seconds (default: run indefinitely)')
+    parser.add_argument('--controller', '-c', type=str, default='position',
+                        help='Type of controller to use (default: position)',
+                        choices=ControllerFactory.get_available_controllers())
     parser.add_argument('--plot-only', action='store_true',
                         help='Skip simulation, just generate plots from existing data')
     
@@ -860,8 +814,12 @@ def main():
             print("⚠️ No existing data found. Run simulation first to generate data.")
             return
         
-        simulation = IntegratedZeroGravitySimulation()
+        simulation = IntegratedZeroGravitySimulation(controller_type=args.controller)
         simulation.run_simulation(duration=args.duration)
+        
+        # Generate plots after simulation is fully complete and viewer is closed
+        print("\n📊 Generating plots from collected simulation data...")
+        simulation.plot_controller_data()
         
     except KeyboardInterrupt:
         print("\n👋 Simulation interrupted by user")
