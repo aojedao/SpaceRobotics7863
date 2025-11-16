@@ -222,11 +222,11 @@ class PositionController(BaseController):
         # Ensure data.ctrl has appropriate length
         n_ctrl = len(self.data.ctrl)
         manual_id = getattr(self, 'manual_actuator_id', None)
-        
+        print(f"Manual actuator ID in apply_control_vector: {manual_id}")
         # Apply command vector (skip manual actuator if it exists)
         for i, val in enumerate(command_vector):
             if i < n_ctrl:
-                # Skip writing to the manual actuator index
+                # Skip writing to the manual actuator indexs
                 if manual_id is not None and i == manual_id:
                     continue
                 self.data.ctrl[i] = float(val)
@@ -235,6 +235,7 @@ class PositionController(BaseController):
         for idx in range(len(command_vector), n_ctrl):
             if manual_id is not None and idx == manual_id:
                 # Preserve manual actuator value set by viewer slider
+                #self.data.ctrl[8] = 2.0
                 continue
             self.data.ctrl[idx] = 0.0
 
@@ -335,6 +336,7 @@ class TorqueBalancingController(BaseController):
         
         # Get current control/torque in 6th axis
         tau_6 = self.data.ctrl[5] if len(self.data.ctrl) > 5 else 0.0
+        print(f"tau_6: {tau_6}")
         
         # The projection of the 6th axis moment to the base is given by
         # how the 6th joint's angular velocity affects the base moment
@@ -342,6 +344,7 @@ class TorqueBalancingController(BaseController):
         
         # Extract the column of J_rot that corresponds to axis 6
         j6_rot = J_rot[:, 5]  # Column 5 (0-indexed) corresponds to joint 6
+        print(f"j6_rot: {j6_rot}")
         
         # The projected moment is the magnitude of this Jacobian column scaled by tau_6
         projected_moment = np.linalg.norm(j6_rot) * np.abs(tau_6)
@@ -365,10 +368,12 @@ class TorqueBalancingController(BaseController):
             cost_gradient: Gradient with respect to joint velocities
         """
         # Get 7th axis torque
-        tau_7 = self.data.ctrl[6] if len(self.data.ctrl) > 6 else 0.0
+        tau_7 = self.data.ctrl[8] if len(self.data.ctrl) > 6 else 0.0
+        #print(f"tau_7: {tau_7}")
         
         # Get projected moment from 6th axis
         projected_moment, j6_rot, tau_6 = self.compute_projected_moment_to_base()
+
         
         # Potential field cost: 1/2 * (tau_7 - projected_moment)^2
         moment_error = tau_7 - projected_moment
@@ -546,9 +551,20 @@ class TorqueBalancingController(BaseController):
         if hasattr(self, 'apply_control_vector'):
             self.apply_control_vector(final_joint_velocities)
         else:
-            self.data.ctrl[:len(final_joint_velocities)] = final_joint_velocities
-            if self.model.nu > len(final_joint_velocities):
-                self.data.ctrl[len(final_joint_velocities):] = 0.0
+            # Fallback: manually apply control while protecting manual actuator
+            manual_id = getattr(self, 'manual_actuator_id', None)
+            manual_id = 6
+            for i, val in enumerate(final_joint_velocities):
+                if i < len(self.data.ctrl):
+                    if manual_id is not None and i == manual_id:
+                        continue  # Skip manual actuator
+                    self.data.ctrl[i] = float(val)
+            # Zero remaining control entries (except manual actuator)
+            for idx in range(len(final_joint_velocities), len(self.data.ctrl)):
+                if manual_id is not None and idx == manual_id:
+                    continue
+                #print(f"Zeroing ctrl at index {idx}")
+                self.data.ctrl[idx] = 0.0
         
         # Store target orientation
         self.current_target_orientation = target_orient_mat

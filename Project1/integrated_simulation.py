@@ -366,7 +366,7 @@ class IntegratedZeroGravitySimulation:
         box_door_assembly = '''
     
     <!-- Box/Door Assembly (floating in zero gravity, positioned closer to robot) -->
-    <body name="box_door_assembly" pos="0.0 0.7 1.2" quat="0.0 1.0 1.0 0">
+    <body name="box_door_assembly" pos="0.0 0.9 1.2" quat="0.0 1.0 1.0 0">
       <freejoint name="assembly_freejoint"/>
       
       <!-- Base Box -->
