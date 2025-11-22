@@ -171,10 +171,10 @@ class PositionController(BaseController):
         # 7. Get Jacobian for control
         J = self.compute_jacobian()
         
-        # 8. Controller gains
-        K_pos = np.diag([8.2, 10.2, 7.0]) * 1.0
-        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.05
-        K_orient_error = np.diag([5.0, 5.0, 0.0]) * 1.5
+        # 8. Controller gains (reduced for free-floating base to prevent crashes)
+        K_pos = np.diag([2.0, 2.5, 1.5]) * 1.0
+        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.02
+        K_orient_error = np.diag([1.5, 1.5, 0.0]) * 0.5
         
         # 9. Compute desired Cartesian velocities
         desired_position_velocity = K_pos @ position_error
@@ -189,8 +189,8 @@ class PositionController(BaseController):
         except np.linalg.LinAlgError:
             joint_velocities = np.zeros(7)
         
-        # 11. Apply velocity limits
-        max_velocity = 4.0
+        # 11. Apply velocity limits (reduced for free-floating base safety)
+        max_velocity = 1.5
         joint_velocities_clipped = np.clip(joint_velocities, -max_velocity, max_velocity)
         
         # 12. Zero out joint 7 command (reserved for manual control)
@@ -588,12 +588,78 @@ class TorqueBalancingController(BaseController):
         }
 
 
-class ControllerFactory:
+class NoControlController(BaseController):
+    """
+    No-control controller that keeps the robot in a static state with zero control inputs.
+    
+    This controller is useful for:
+    - Testing the dynamics of the free-floating base without active control
+    - Observing the robot's behavior under gravity or external forces
+    - Baseline testing and validation
+    """
+    
+    def __init__(self, model, data, **kwargs):
+        """
+        Initialize no-control controller
+        
+        Args:
+            model: MuJoCo model
+            data: MuJoCo data
+            **kwargs: Additional parameters (unused for this controller)
+        """
+        super().__init__(model, data)
+        self.target_position = None
+        self.target_orientation = None
+        
+    def compute_control(self):
+        """Compute no control - all control signals are zero"""
+        if not self.enabled:
+            return
+        
+        # Zero out all control inputs
+        self.data.ctrl[:] = 0.0
+        
+        # Get current state for data collection (but don't control anything)
+        current_pos = self.get_end_effector_position()
+        current_orient_mat = self.get_end_effector_orientation()
+        self.target_position = self.get_target_position()
+        self.target_orientation = self.get_target_orientation()
+        current_joint_vel = self.data.qvel[:7]
+        
+        # Compute Jacobian for angular velocity calculation
+        J_full = self.compute_jacobian()
+        J_rot = J_full[3:6, :7]
+        current_angular_vel = J_rot @ current_joint_vel
+        
+        # Calculate errors for monitoring (but not used for control)
+        position_error = self.target_position - current_pos
+        RotationCorrecter = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
+        target_orient_mat = RotationCorrecter @ self.target_orientation
+        R_error = current_orient_mat.T @ target_orient_mat
+        orientation_error = np.array([
+            R_error[2, 1] - R_error[1, 2],
+            R_error[0, 2] - R_error[2, 0],
+            R_error[1, 0] - R_error[0, 1]
+        ]) * 0.5
+        
+        return {
+            'current_pos': current_pos,
+            'current_orient': current_orient_mat,
+            'target_orient': target_orient_mat,
+            'position_error': position_error,
+            'orientation_error': orientation_error,
+            'current_joint_vel': current_joint_vel,
+            'current_angular_vel': current_angular_vel
+        }
+
+
+class ControllerFactory(ABC):
     """Factory class for creating controller instances"""
     
     AVAILABLE_CONTROLLERS = {
         'position': PositionController,
         'torque_balancing': TorqueBalancingController,
+        'no_control': NoControlController,
     }
     
     @classmethod
