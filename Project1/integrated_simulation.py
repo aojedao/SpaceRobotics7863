@@ -241,6 +241,16 @@ class IntegratedZeroGravitySimulation:
                                     '\n' + gripper_defaults + 
                                     integrated_content[next_default_end:])
         
+        # Add freejoint to base body to make it float freely in zero gravity
+        base_inertial_pattern = '<inertial mass="5" pos="-0.1 0 0.07" diaginertia="0.05 0.06 0.03"/>'
+        base_inertial_pos = integrated_content.find(base_inertial_pattern)
+        if base_inertial_pos != -1:
+            # Insert freejoint right before the inertial tag
+            freejoint_insertion = '      <freejoint name="base_freejoint"/>\n      '
+            integrated_content = (integrated_content[:base_inertial_pos] + 
+                                freejoint_insertion + 
+                                integrated_content[base_inertial_pos:])
+        
         # Add environment and extensions to worldbody (before the last </body> </worldbody>)
         environment_and_extensions = '''
     

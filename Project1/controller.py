@@ -222,7 +222,7 @@ class PositionController(BaseController):
         # Ensure data.ctrl has appropriate length
         n_ctrl = len(self.data.ctrl)
         manual_id = getattr(self, 'manual_actuator_id', None)
-        print(f"Manual actuator ID in apply_control_vector: {manual_id}")
+        #print(f"Manual actuator ID in apply_control_vector: {manual_id}")
         # Apply command vector (skip manual actuator if it exists)
         for i, val in enumerate(command_vector):
             if i < n_ctrl:
@@ -335,8 +335,9 @@ class TorqueBalancingController(BaseController):
         J_rot = J[3:6, :7]  # Rotational part of Jacobian (3x7)
         
         # Get current control/torque in 6th axis
+        
         tau_6 = self.data.ctrl[5] if len(self.data.ctrl) > 5 else 0.0
-        print(f"tau_6: {tau_6}")
+        #print(f"tau_6: {tau_6}")
         
         # The projection of the 6th axis moment to the base is given by
         # how the 6th joint's angular velocity affects the base moment
@@ -344,7 +345,7 @@ class TorqueBalancingController(BaseController):
         
         # Extract the column of J_rot that corresponds to axis 6
         j6_rot = J_rot[:, 5]  # Column 5 (0-indexed) corresponds to joint 6
-        print(f"j6_rot: {j6_rot}")
+        #print(f"j6_rot: {j6_rot}")
         
         # The projected moment is the magnitude of this Jacobian column scaled by tau_6
         projected_moment = np.linalg.norm(j6_rot) * np.abs(tau_6)
