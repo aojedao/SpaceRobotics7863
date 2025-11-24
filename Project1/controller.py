@@ -172,7 +172,7 @@ class PositionController(BaseController):
         J = self.compute_jacobian()
         
         # 8. Controller gains (reduced for free-floating base to prevent crashes)
-        K_pos = np.diag([2.0, 2.5, 1.5]) * 1.0
+        K_pos = np.diag([2.0, 2.5, 1.5]) * 2.0
         K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.02
         K_orient_error = np.diag([1.5, 1.5, 0.0]) * 0.5
         
@@ -190,7 +190,7 @@ class PositionController(BaseController):
             joint_velocities = np.zeros(7)
         
         # 11. Apply velocity limits (reduced for free-floating base safety)
-        max_velocity = 1.5
+        max_velocity = 2.0
         joint_velocities_clipped = np.clip(joint_velocities, -max_velocity, max_velocity)
         
         # 12. Zero out joint 7 command (reserved for manual control)
@@ -506,9 +506,9 @@ class TorqueBalancingController(BaseController):
         
         J = self.compute_jacobian()
         
-        K_pos = np.diag([8.2, 10.2, 7.0]) * 1.0
-        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.05
-        K_orient_error = np.diag([5.0, 5.0, 0.0]) * 1.5
+        K_pos = np.diag([8.2, 10.2, 7.0]) * 0.5
+        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.005
+        K_orient_error = np.diag([5.0, 5.0, 0.0]) * 0.05
         
         desired_position_velocity = K_pos @ position_error
         desired_angular_velocity = (K_orient_error @ orientation_error) - (K_angular_vel @ angular_vel_err)
@@ -536,7 +536,7 @@ class TorqueBalancingController(BaseController):
         
         # 9. Combine base position control with moment balancing
         # Use velocity commands for primary task, moment corrections in null space
-        max_velocity = 4.0
+        max_velocity = 2.0
         base_joint_velocities_clipped = np.clip(base_joint_velocities, -max_velocity, max_velocity)
         
         # 10. Apply corrections (small corrections to avoid task disruption)
@@ -612,11 +612,12 @@ class NoControlController(BaseController):
         self.target_orientation = None
         
     def compute_control(self):
-        """Compute no control - all control signals are zero"""
+        """Compute no control - all control signals are zero, joints are completely unactuated"""
         if not self.enabled:
             return
         
-        # Zero out all control inputs
+        # Zero out all control inputs to disable all actuators
+        # This makes the joints completely unactuated and free to move passively
         self.data.ctrl[:] = 0.0
         
         # Get current state for data collection (but don't control anything)

@@ -61,7 +61,7 @@ class IntegratedZeroGravitySimulation:
         # Movement step sizes
         self.position_step = 0.02  # meters
         self.position_step_fast = 0.05  # faster movement
-        self.impulse_strength = 2.0  # impulse strength for box movement
+        #self.impulse_strength = 2.0  # impulse strength for box movement
         
         # Other control state
         self.gripper_target = 0.0  # Robotiq 2f85 gripper (0=open, 255=closed)
@@ -241,16 +241,6 @@ class IntegratedZeroGravitySimulation:
                                     '\n' + gripper_defaults + 
                                     integrated_content[next_default_end:])
         
-        # Add freejoint to base body to make it float freely in zero gravity
-        base_inertial_pattern = '<inertial mass="5" pos="-0.1 0 0.07" diaginertia="0.05 0.06 0.03"/>'
-        base_inertial_pos = integrated_content.find(base_inertial_pattern)
-        if base_inertial_pos != -1:
-            # Insert freejoint right before the inertial tag
-            freejoint_insertion = '      <freejoint name="base_freejoint"/>\n      '
-            integrated_content = (integrated_content[:base_inertial_pos] + 
-                                freejoint_insertion + 
-                                integrated_content[base_inertial_pos:])
-        
         # Add environment and extensions to worldbody (before the last </body> </worldbody>)
         environment_and_extensions = '''
     
@@ -376,7 +366,7 @@ class IntegratedZeroGravitySimulation:
         box_door_assembly = '''
     
     <!-- Box/Door Assembly (floating in zero gravity, positioned closer to robot) -->
-    <body name="box_door_assembly" pos="0.0 0.9 1.2" quat="0.0 1.0 1.0 0">
+    <body name="box_door_assembly" pos="0.0 0.7 1.2" quat="0.0 1.0 1.0 0">
       <freejoint name="assembly_freejoint"/>
       
       <!-- Base Box -->
@@ -408,7 +398,6 @@ class IntegratedZeroGravitySimulation:
                  range="0 1.5708"
                  damping="5.0"/>
           <geom name="door_geom" type="mesh" mesh="Door" material="mat_door" contype="1" conaffinity="1" friction="0.7 0.1 0.1"/>
-          <inertial pos="0 0 0" mass="0.2" diaginertia="0.02 0.02 0.02"/>
         </body>
         
       </body>
@@ -765,6 +754,17 @@ class IntegratedZeroGravitySimulation:
             viewer.cam.elevation=-20.0
             # Initialize to default position
             mujoco.mj_resetData(self.model, self.data)
+            
+            # Zero all velocities and set all joints to zero position
+            self.data.qvel[:] = 0.0
+            self.data.qpos[:] = 0.0
+            self.data.qpos[3] = 1.0  # Set base quaternion to identity (w=1)
+            
+            # Forward kinematics to update all body positions
+            mujoco.mj_forward(self.model, self.data)
+            
+            print(f"✓ Robot initialized: Free-floating base (6 DOF), all joints unactuated")
+            print(f"  The robot will respond only to physics - NO controller actuation")
             
             while viewer.is_running():
                 step_start = time.time()
