@@ -97,6 +97,67 @@ class BaseController(ABC):
         else:
             return np.eye(6, 7)
     
+    def compute_position_error(self, current_pos, target_pos, approach_offset=None):
+        """
+        Compute position error for tracking.
+        
+        Args:
+            current_pos: Current end-effector position
+            target_pos: Target position (e.g., box/door handle)
+            approach_offset: Optional offset for approach position (default: None, track directly)
+            
+        Returns:
+            position_error: 3D position error vector
+        """
+        if approach_offset is not None:
+            return target_pos - current_pos + approach_offset
+        return target_pos - current_pos
+    
+    def compute_orientation_error(self, current_orient_mat, target_orient_mat):
+        """
+        Compute orientation error between current and target orientations.
+        
+        Args:
+            current_orient_mat: Current orientation as 3x3 rotation matrix
+            target_orient_mat: Target orientation as 3x3 rotation matrix
+            
+        Returns:
+            orientation_error: 3D orientation error vector (axis-angle representation)
+        """
+        R_error = current_orient_mat.T @ target_orient_mat
+        orientation_error = np.array([
+            R_error[2, 1] - R_error[1, 2],
+            R_error[0, 2] - R_error[2, 0],
+            R_error[1, 0] - R_error[0, 1]
+        ]) * 0.5
+        return orientation_error
+    
+    def apply_control_vector(self, command_vector):
+        """
+        Apply a control vector to self.data.ctrl while respecting manual actuator.
+        
+        If a manual actuator (named 'manual_joint7') exists, its ctrl entry will not
+        be overwritten so the viewer slider can be used to inject manual torque.
+        
+        Args:
+            command_vector: Array of control commands for arm joints
+        """
+        n_ctrl = len(self.data.ctrl)
+        manual_id = getattr(self, 'manual_actuator_id', None)
+        
+        # Apply command vector (skip manual actuator if it exists)
+        for i, val in enumerate(command_vector):
+            if i < n_ctrl:
+                if manual_id is not None and i == manual_id:
+                    continue
+                self.data.ctrl[i] = float(val)
+        
+        # Zero remaining ctrl entries (except manual actuator)
+        for idx in range(len(command_vector), n_ctrl):
+            if manual_id is not None and idx == manual_id:
+                continue
+            self.data.ctrl[idx] = 0.0
+    
     @abstractmethod
     def compute_control(self):
         """Compute control commands - must be implemented by subclasses"""
@@ -108,12 +169,15 @@ class PositionController(BaseController):
     Standard position controller using Cartesian space control with quaternion orientation.
     
     Features:
-    - 6DOF Cartesian space control
+    - 6DOF Cartesian space control (dynamically tracks target wherever it moves)
     - Quaternion-based orientation control
     - Redundant manipulator control with null space projection
     - Damped least squares to avoid singularities
     - Angular velocity damping for orientation stability
     """
+    
+    # Rotation correction matrix for aligning gripper frame to target frame
+    ROTATION_CORRECTOR = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
     
     def __init__(self, model, data, **kwargs):
         """
@@ -122,84 +186,77 @@ class PositionController(BaseController):
         Args:
             model: MuJoCo model
             data: MuJoCo data
-            **kwargs: Additional parameters (kp_position, kd_position, max_joint_velocity)
+            **kwargs: Additional parameters:
+                - kp_position: Position gain (default: 100.0)
+                - kd_position: Position derivative gain (default: 20.0)
+                - max_joint_velocity: Maximum joint velocity (default: 2.0)
+                - approach_offset: Optional 3D offset for approach position (default: None)
         """
         super().__init__(model, data)
         self.kp_position = kwargs.get('kp_position', 100.0)
         self.kd_position = kwargs.get('kd_position', 20.0)
         self.max_joint_velocity = kwargs.get('max_joint_velocity', 2.0)
+        self.approach_offset = kwargs.get('approach_offset', None)  # Dynamic tracking by default
         self.target_position = None
         self.target_orientation = None
         self.current_target_orientation = None
+        
+        # Controller gains
+        self.K_pos = np.diag([2.0, 2.5, 1.5]) * 5.0
+        self.K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.02
+        self.K_orient_error = np.diag([1.5, 1.5, 0.0]) * 0.5
+        self.lambda_damping = 0.25
     
     def compute_control(self):
-        """Compute position control commands"""
+        """Compute position control commands - dynamically tracks target position"""
         if not self.enabled:
             return
         
-        # 1. Get current state
+        # Get current state
         current_pos = self.get_end_effector_position()
         current_orient_mat = self.get_end_effector_orientation()
         self.target_position = self.get_target_position()
         self.target_orientation = self.get_target_orientation()
         current_joint_vel = self.data.qvel[:7]
         
-        # 2. Compute Jacobian and angular velocity
-        J_full = self.compute_jacobian()
-        J_rot = J_full[3:6, :7]
+        # Compute Jacobian and angular velocity
+        J = self.compute_jacobian()
+        J_rot = J[3:6, :7]
         current_angular_vel = J_rot @ current_joint_vel
         
-        # 3. Calculate position error
-        position_error = self.target_position - current_pos + np.array([-0.15, 0.15, -0.25])
+        # Calculate position error (dynamically tracks target)
+        position_error = self.compute_position_error(
+            current_pos, self.target_position, self.approach_offset
+        )
         
-        # 4. Apply rotation correction
-        RotationCorrecter = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
-        target_orient_mat = RotationCorrecter @ self.target_orientation
+        # Apply rotation correction and compute orientation error
+        target_orient_mat = self.ROTATION_CORRECTOR @ self.target_orientation
+        orientation_error = self.compute_orientation_error(current_orient_mat, target_orient_mat)
         
-        # 5. Calculate orientation error
-        R_error = current_orient_mat.T @ target_orient_mat
-        orientation_error = np.array([
-            R_error[2, 1] - R_error[1, 2],
-            R_error[0, 2] - R_error[2, 0],
-            R_error[1, 0] - R_error[0, 1]
-        ]) * 0.5
-        
-        # 6. Calculate angular velocity error
+        # Calculate angular velocity error
         target_angular_vel = self.data.qvel[3:6] if self.model.nv > 6 else np.zeros(3)
         angular_vel_err = current_angular_vel - target_angular_vel
         
-        # 7. Get Jacobian for control
-        J = self.compute_jacobian()
-        
-        # 8. Controller gains (reduced for free-floating base to prevent crashes)
-        K_pos = np.diag([2.0, 2.5, 1.5]) * 2.0
-        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.02
-        K_orient_error = np.diag([1.5, 1.5, 0.0]) * 0.5
-        
-        # 9. Compute desired Cartesian velocities
-        desired_position_velocity = K_pos @ position_error
-        desired_angular_velocity = (K_orient_error @ orientation_error) - (K_angular_vel @ angular_vel_err)
+        # Compute desired Cartesian velocities
+        desired_position_velocity = self.K_pos @ position_error
+        desired_angular_velocity = (self.K_orient_error @ orientation_error) - (self.K_angular_vel @ angular_vel_err)
         desired_cartesian_velocity = np.concatenate([desired_position_velocity, desired_angular_velocity])
         
-        # 10. Map to joint space with damped least squares
+        # Map to joint space with damped least squares
         try:
-            lambda_damping = 0.25
-            J_damped_pinv = J.T @ np.linalg.inv(J @ J.T + lambda_damping * np.eye(6))
+            J_damped_pinv = J.T @ np.linalg.inv(J @ J.T + self.lambda_damping * np.eye(6))
             joint_velocities = J_damped_pinv @ desired_cartesian_velocity
         except np.linalg.LinAlgError:
             joint_velocities = np.zeros(7)
         
-        # 11. Apply velocity limits (reduced for free-floating base safety)
-        max_velocity = 2.0
-        joint_velocities_clipped = np.clip(joint_velocities, -max_velocity, max_velocity)
-        
-        # 12. Zero out joint 7 command (reserved for manual control)
+        # Apply velocity limits and zero out joint 7 (reserved for manual control)
+        joint_velocities_clipped = np.clip(joint_velocities, -self.max_joint_velocity, self.max_joint_velocity)
         joint_velocities_clipped[6] = 0.0
         
-        # 13. Set control commands (respect manual actuator if present)
+        # Apply control commands
         self.apply_control_vector(joint_velocities_clipped)
         
-        # Store target orientation for visualization
+        # Store for visualization
         self.current_target_orientation = target_orient_mat
         self.previous_position_error = position_error.copy()
         
@@ -213,47 +270,20 @@ class PositionController(BaseController):
             'current_angular_vel': current_angular_vel
         }
 
-    def apply_control_vector(self, command_vector):
-        """Apply a control vector to self.data.ctrl while respecting manual actuator.
-
-        If a manual actuator (named 'manual_joint7') exists its ctrl entry will not be overwritten
-        so the viewer slider can be used to inject manual torque into joint7.
-        """
-        # Ensure data.ctrl has appropriate length
-        n_ctrl = len(self.data.ctrl)
-        manual_id = getattr(self, 'manual_actuator_id', None)
-        #print(f"Manual actuator ID in apply_control_vector: {manual_id}")
-        # Apply command vector (skip manual actuator if it exists)
-        for i, val in enumerate(command_vector):
-            if i < n_ctrl:
-                # Skip writing to the manual actuator indexs
-                if manual_id is not None and i == manual_id:
-                    continue
-                self.data.ctrl[i] = float(val)
-        
-        # Zero remaining ctrl entries (except manual actuator)
-        for idx in range(len(command_vector), n_ctrl):
-            if manual_id is not None and idx == manual_id:
-                # Preserve manual actuator value set by viewer slider
-                #self.data.ctrl[8] = 2.0
-                continue
-            self.data.ctrl[idx] = 0.0
-
 
 class TorqueBalancingController(BaseController):
     """
     Advanced torque-balancing controller that minimizes base shear forces.
     
-    This controller calculates the torque in the sixth axis (wrist rotation) and
-    uses the difference between torques in the 6th and 7th axes to minimize
-    shear forces transmitted to the base.
-    
     Features:
+    - Dynamically tracks target position (same as PositionController)
     - Torque calculation and balancing
-    - Base shear force minimization
-    - Wrench control at end-effector
+    - Base shear force minimization using moment-based cost function
     - Null space optimization for force distribution
     """
+    
+    # Shared rotation correction matrix
+    ROTATION_CORRECTOR = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
     
     def __init__(self, model, data, **kwargs):
         """
@@ -262,8 +292,205 @@ class TorqueBalancingController(BaseController):
         Args:
             model: MuJoCo model
             data: MuJoCo data
-            **kwargs: Additional parameters
+            **kwargs: Additional parameters:
+                - max_joint_velocity: Maximum joint velocity (default: 2.0)
+                - approach_offset: Optional 3D offset for approach position (default: None)
+                - torque_balance_gain: Gain for moment balancing (default: 0.5)
         """
+        super().__init__(model, data)
+        self.max_joint_velocity = kwargs.get('max_joint_velocity', 2.0)
+        self.approach_offset = kwargs.get('approach_offset', None)
+        self.torque_balance_gain = kwargs.get('torque_balance_gain', 0.5)
+        self.target_position = None
+        self.target_orientation = None
+        self.current_target_orientation = None
+        
+        # Controller gains (different from PositionController for torque balancing)
+        self.K_pos = np.diag([8.2, 10.2, 7.0]) * 0.5
+        self.K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.005
+        self.K_orient_error = np.diag([5.0, 5.0, 0.0]) * 0.05
+        self.lambda_damping = 0.25
+        
+    def compute_joint_torques(self):
+        """
+        Compute torques acting on each joint using inverse dynamics.
+        
+        Returns:
+            torques: 7-element array of joint torques
+        """
+        torques = np.zeros(7)
+        for i in range(7):
+            if i < len(self.data.ctrl) and i < len(self.model.actuator_gear):
+                gear_ratio = self.model.actuator_gear[i, 0] if len(self.model.actuator_gear[i]) > 0 else 1.0
+                torques[i] = self.data.ctrl[i] * gear_ratio
+        return torques
+    
+    def compute_projected_moment_to_base(self):
+        """
+        Compute the moment from the 6th actuator projected to the base.
+        
+        Returns:
+            projected_moment: Projected moment magnitude at base
+            j6_rot: Rotational Jacobian column for joint 6
+            tau_6: Current torque in 6th axis
+        """
+        J = self.compute_jacobian()
+        J_rot = J[3:6, :7]
+        tau_6 = self.data.ctrl[5] if len(self.data.ctrl) > 5 else 0.0
+        j6_rot = J_rot[:, 5]
+        projected_moment = np.linalg.norm(j6_rot) * np.abs(tau_6)
+        return projected_moment, j6_rot, tau_6
+    
+    def compute_base_moment_cost(self):
+        """
+        Compute potential field cost for base moment minimization.
+        
+        Cost function: 1/2 * (tau_7 - projected_moment_from_tau_6)^2
+        
+        Returns:
+            cost: Potential field cost value
+            moment_error: Difference between tau_7 and projected_moment
+            cost_data: Dictionary with detailed cost information
+        """
+        tau_7 = self.data.ctrl[8] if len(self.data.ctrl) > 6 else 0.0
+        projected_moment, j6_rot, tau_6 = self.compute_projected_moment_to_base()
+        
+        moment_error = tau_7 - projected_moment
+        cost = 0.5 * moment_error**2
+        
+        return cost, moment_error, {
+            'tau_7': tau_7,
+            'tau_6': tau_6,
+            'projected_moment': projected_moment,
+            'moment_error': moment_error,
+            'cost': cost,
+            'cost_grad_tau7': moment_error,
+            'cost_grad_tau6': -moment_error * np.linalg.norm(j6_rot),
+            'j6_rot': j6_rot
+        }
+    
+    def compute_null_space_torque_correction(self, joint_torques):
+        """
+        Compute null space torque corrections using gradient of moment cost function.
+        
+        Args:
+            joint_torques: 7-element array of current joint torques
+            
+        Returns:
+            correction_torques: Corrective torques in null space to minimize base moment
+        """
+        J = self.compute_jacobian()
+        
+        try:
+            J_pinv = np.linalg.pinv(J)
+            N = np.eye(7) - J_pinv @ J
+        except np.linalg.LinAlgError:
+            N = np.eye(7)
+        
+        cost, moment_error, cost_data = self.compute_base_moment_cost()
+        j6_rot = cost_data['j6_rot']
+        
+        correction_vector = np.zeros(7)
+        if np.abs(moment_error) > 1e-6:
+            correction_gain = self.torque_balance_gain
+            correction_vector[5] = -moment_error * correction_gain * np.linalg.norm(j6_rot)
+            correction_vector[6] = -moment_error * correction_gain
+        
+        return N @ correction_vector
+    
+    def compute_control(self):
+        """Compute torque-balancing control commands using moment minimization"""
+        if not self.enabled:
+            return
+        
+        # Get current state
+        current_pos = self.get_end_effector_position()
+        current_orient_mat = self.get_end_effector_orientation()
+        self.target_position = self.get_target_position()
+        self.target_orientation = self.get_target_orientation()
+        current_joint_vel = self.data.qvel[:7]
+        
+        # Compute Jacobian and angular velocity
+        J = self.compute_jacobian()
+        J_rot = J[3:6, :7]
+        current_angular_vel = J_rot @ current_joint_vel
+        
+        # Calculate errors using shared methods (dynamic tracking)
+        position_error = self.compute_position_error(
+            current_pos, self.target_position, self.approach_offset
+        )
+        target_orient_mat = self.ROTATION_CORRECTOR @ self.target_orientation
+        orientation_error = self.compute_orientation_error(current_orient_mat, target_orient_mat)
+        
+        # Angular velocity error
+        target_angular_vel = self.data.qvel[3:6] if self.model.nv > 6 else np.zeros(3)
+        angular_vel_err = current_angular_vel - target_angular_vel
+        
+        # Compute desired Cartesian velocities
+        desired_position_velocity = self.K_pos @ position_error
+        desired_angular_velocity = (self.K_orient_error @ orientation_error) - (self.K_angular_vel @ angular_vel_err)
+        desired_cartesian_velocity = np.concatenate([desired_position_velocity, desired_angular_velocity])
+        
+        # Map to joint space with damped least squares
+        try:
+            J_damped_pinv = J.T @ np.linalg.inv(J @ J.T + self.lambda_damping * np.eye(6))
+            base_joint_velocities = J_damped_pinv @ desired_cartesian_velocity
+        except np.linalg.LinAlgError:
+            base_joint_velocities = np.zeros(7)
+        
+        # Compute moment-based corrections
+        joint_torques = self.compute_joint_torques()
+        cost, moment_error, cost_data = self.compute_base_moment_cost()
+        moment_correction = self.compute_null_space_torque_correction(joint_torques)
+        
+        # Combine base control with moment corrections
+        base_joint_velocities_clipped = np.clip(base_joint_velocities, -self.max_joint_velocity, self.max_joint_velocity)
+        correction_scaling = 0.01
+        final_joint_velocities = base_joint_velocities_clipped + correction_scaling * moment_correction[:7]
+        final_joint_velocities = np.clip(final_joint_velocities, -self.max_joint_velocity, self.max_joint_velocity)
+        
+        # Zero out joint 7 (reserved for manual control)
+        #final_joint_velocities[6] = 0.0
+        
+        # Apply control (uses shared method from BaseController)
+        self.apply_control_vector(final_joint_velocities)
+        
+        # Store for visualization
+        self.current_target_orientation = target_orient_mat
+        self.previous_position_error = position_error.copy()
+        
+        return {
+            'current_pos': current_pos,
+            'current_orient': current_orient_mat,
+            'target_orient': target_orient_mat,
+            'position_error': position_error,
+            'orientation_error': orientation_error,
+            'current_joint_vel': current_joint_vel,
+            'current_angular_vel': current_angular_vel,
+            'moment_cost': cost,
+            'moment_error': moment_error,
+            'tau_6': cost_data['tau_6'],
+            'tau_7': cost_data['tau_7'],
+            'projected_moment_to_base': cost_data['projected_moment'],
+            'joint_torques': joint_torques
+        }
+
+
+class OldTorqueBalancingController(BaseController):
+    """
+    Original torque-balancing controller (before refactoring).
+    
+    This is the original implementation with hardcoded position offsets and
+    higher gains, preserved for comparison purposes.
+    
+    Features:
+    - Original hardcoded position offset [-0.15, 0.15, -0.25]
+    - Original higher gains (K_pos * 1.0, K_orient * 1.5)
+    - tau_7 read from ctrl[6] instead of ctrl[8]
+    """
+    
+    def __init__(self, model, data, **kwargs):
+        """Initialize original torque-balancing controller"""
         super().__init__(model, data)
         self.kp_position = kwargs.get('kp_position', 100.0)
         self.kd_position = kwargs.get('kd_position', 20.0)
@@ -275,116 +502,46 @@ class TorqueBalancingController(BaseController):
         self.shear_force_threshold = kwargs.get('shear_force_threshold', 0.1)
         
     def compute_joint_torques(self):
-        """
-        Compute torques acting on each joint using inverse dynamics.
-        
-        Returns:
-            torques: 7-element array of joint torques
-        """
-        # Compute torques using MuJoCo's inverse dynamics
+        """Compute torques acting on each joint using inverse dynamics."""
         torques = np.zeros(7)
-        
-        # Calculate torques using the relationship tau = J^T * F
-        # where J is Jacobian and F is wrench at end effector
         J = self.compute_jacobian()
-        
-        # Get actuator forces from control and joint properties
-        # actuator_gear is a (n_actuators, 6) array, we need the first column (gear ratio)
         for i in range(7):
             if i < len(self.data.ctrl) and i < len(self.model.actuator_gear):
                 gear_ratio = self.model.actuator_gear[i, 0] if len(self.model.actuator_gear[i]) > 0 else 1.0
                 torques[i] = self.data.ctrl[i] * gear_ratio
-        
         return torques
     
     def calculate_wrench_at_endeffector(self):
-        """
-        Calculate the wrench (force and torque) at the end-effector.
-        
-        Returns:
-            wrench: 6-element array [Fx, Fy, Fz, Mx, My, Mz]
-        """
-        # In zero-gravity environment, wrench is primarily from control
-        # This is a simplified calculation
+        """Calculate the wrench (force and torque) at the end-effector."""
         wrench = np.zeros(6)
-        
         J = self.compute_jacobian()
         joint_torques = self.compute_joint_torques()
-        
-        # Wrench at end-effector = J^-T * joint_torques
         try:
             J_inv_T = np.linalg.pinv(J.T)
             wrench = J_inv_T @ joint_torques
         except np.linalg.LinAlgError:
             pass
-        
         return wrench
     
     def compute_projected_moment_to_base(self):
-        """
-        Compute the moment from the 6th actuator (wrist rotation) projected to the base.
-        
-        This represents how the 6th axis torque propagates through the kinematic chain
-        and manifests as a moment at the base.
-        
-        Returns:
-            projected_moment: Projected moment magnitude at base from 6th axis torque
-        """
-        # Get the Jacobian to understand torque transmission
+        """Compute the moment from the 6th actuator projected to the base."""
         J = self.compute_jacobian()
-        J_rot = J[3:6, :7]  # Rotational part of Jacobian (3x7)
-        
-        # Get current control/torque in 6th axis
-        
+        J_rot = J[3:6, :7]
         tau_6 = self.data.ctrl[5] if len(self.data.ctrl) > 5 else 0.0
-        #print(f"tau_6: {tau_6}")
-        
-        # The projection of the 6th axis moment to the base is given by
-        # how the 6th joint's angular velocity affects the base moment
-        # We use the rotational Jacobian row corresponding to axis 6
-        
-        # Extract the column of J_rot that corresponds to axis 6
-        j6_rot = J_rot[:, 5]  # Column 5 (0-indexed) corresponds to joint 6
-        #print(f"j6_rot: {j6_rot}")
-        
-        # The projected moment is the magnitude of this Jacobian column scaled by tau_6
+        j6_rot = J_rot[:, 5]
         projected_moment = np.linalg.norm(j6_rot) * np.abs(tau_6)
-        
         return projected_moment, j6_rot, tau_6
     
     def compute_base_moment_cost(self):
-        """
-        Compute potential field cost for base moment minimization.
-        
-        Cost function: 1/2 * (tau_7 - projected_moment_from_tau_6)^2
-        
-        This is analogous to obstacle avoidance potential field:
-        - tau_7: The 7th axis torque (what we're trying to maintain)
-        - projected_moment_from_tau_6: How the 6th axis moment projects to the base
-        
-        By minimizing their difference, we reduce the net moment at the base.
-        
-        Returns:
-            cost: Potential field cost value
-            cost_gradient: Gradient with respect to joint velocities
-        """
-        # Get 7th axis torque
-        tau_7 = self.data.ctrl[8] if len(self.data.ctrl) > 6 else 0.0
-        #print(f"tau_7: {tau_7}")
-        
-        # Get projected moment from 6th axis
+        """Compute potential field cost for base moment minimization."""
+        # Original: tau_7 from ctrl[6]
+        tau_7 = self.data.ctrl[6] if len(self.data.ctrl) > 6 else 0.0
         projected_moment, j6_rot, tau_6 = self.compute_projected_moment_to_base()
-
         
-        # Potential field cost: 1/2 * (tau_7 - projected_moment)^2
         moment_error = tau_7 - projected_moment
         cost = 0.5 * moment_error**2
-        
-        # Gradient of cost with respect to the moment difference
-        # For null-space correction, we need to understand how to reduce this cost
-        # Cost gradient w.r.t. torques: d(cost)/d(tau_7) and d(cost)/d(tau_6)
-        cost_grad_tau7 = moment_error  # Positive if tau_7 > projected_moment
-        cost_grad_tau6 = -moment_error * np.linalg.norm(j6_rot)  # How tau_6 affects cost
+        cost_grad_tau7 = moment_error
+        cost_grad_tau6 = -moment_error * np.linalg.norm(j6_rot)
         
         return cost, moment_error, {
             'tau_7': tau_7,
@@ -398,96 +555,51 @@ class TorqueBalancingController(BaseController):
         }
     
     def compute_null_space_torque_correction(self, joint_torques):
-        """
-        Compute null space torque corrections using gradient of moment cost function.
-        
-        This method computes corrections in the null space of the Jacobian that
-        minimize the potential field cost: 1/2 * (tau_7 - projected_moment_from_tau_6)^2
-        
-        The correction moves in the direction that reduces the moment error while
-        maintaining the primary end-effector task.
-        
-        Args:
-            joint_torques: 7-element array of current joint torques
-            
-        Returns:
-            correction_torques: Corrective torques in null space to minimize base moment
-        """
+        """Compute null space torque corrections using gradient of moment cost function."""
         J = self.compute_jacobian()
-        
-        # Compute null space projector: N = I - J^+ * J
         try:
             J_pinv = np.linalg.pinv(J)
             N = np.eye(7) - J_pinv @ J
         except np.linalg.LinAlgError:
             N = np.eye(7)
         
-        # Get moment cost information
         cost, moment_error, cost_data = self.compute_base_moment_cost()
-        
-        # Extract gradient information
-        cost_grad_tau7 = cost_data['cost_grad_tau7']
-        cost_grad_tau6 = cost_data['cost_grad_tau6']
         j6_rot = cost_data['j6_rot']
-        tau_6 = cost_data['tau_6']
-        projected_moment = cost_data['projected_moment']
-        
-        # Create a correction vector that reduces the cost
-        # We want to adjust joint velocities to minimize:
-        # 1/2 * (tau_7 - projected_moment)^2
-        
-        # Correction strategy:
-        # If tau_7 > projected_moment: we want to reduce tau_7 or increase projected_moment
-        # If tau_7 < projected_moment: we want to increase tau_7 or decrease projected_moment
         
         correction_vector = np.zeros(7)
-        
-        # For joint 6 (index 5): affects projected_moment through tau_6
-        # Reducing tau_6 reduces projected_moment (if tau_7 > projected_moment)
-        if np.abs(moment_error) > 1e-6:  # Only correct if there's significant error
-            # Gain for the correction (tuned parameter)
+        if np.abs(moment_error) > 1e-6:
             correction_gain = self.torque_balance_gain
-            
-            # Joint 6 correction: proportional to moment error
-            # If moment_error > 0 (tau_7 > projected_moment), reduce tau_6
             correction_vector[5] = -moment_error * correction_gain * np.linalg.norm(j6_rot)
-            
-            # Joint 7 correction: proportional to moment error (opposite sign)
-            # If moment_error > 0 (tau_7 > projected_moment), reduce tau_7
             correction_vector[6] = -moment_error * correction_gain
         
-        # Project correction to null space to not disturb primary task
         null_space_correction = N @ correction_vector
-        
-        # Store debug info for later analysis
         self._last_correction_data = {
             'moment_error': moment_error,
             'cost': cost,
             'tau_7': cost_data['tau_7'],
             'tau_6': cost_data['tau_6'],
-            'projected_moment': projected_moment
+            'projected_moment': cost_data['projected_moment']
         }
-        
         return null_space_correction
     
     def compute_control(self):
-        """Compute torque-balancing control commands using moment minimization"""
+        """Compute torque-balancing control commands (original implementation)"""
         if not self.enabled:
             return
         
-        # 1. Get current state (same as position controller)
+        # Get current state
         current_pos = self.get_end_effector_position()
         current_orient_mat = self.get_end_effector_orientation()
         self.target_position = self.get_target_position()
         self.target_orientation = self.get_target_orientation()
         current_joint_vel = self.data.qvel[:7]
         
-        # 2. Compute Jacobian and angular velocity
+        # Compute Jacobian and angular velocity
         J_full = self.compute_jacobian()
         J_rot = J_full[3:6, :7]
         current_angular_vel = J_rot @ current_joint_vel
         
-        # 3. Calculate position and orientation errors
+        # Original: hardcoded position offset
         position_error = self.target_position - current_pos + np.array([-0.15, 0.15, -0.25])
         
         RotationCorrecter = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
@@ -500,21 +612,20 @@ class TorqueBalancingController(BaseController):
             R_error[1, 0] - R_error[0, 1]
         ]) * 0.5
         
-        # 4. Compute base position control (same as position controller)
         target_angular_vel = self.data.qvel[3:6] if self.model.nv > 6 else np.zeros(3)
         angular_vel_err = current_angular_vel - target_angular_vel
         
         J = self.compute_jacobian()
         
-        K_pos = np.diag([8.2, 10.2, 7.0]) * 0.5
-        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.005
-        K_orient_error = np.diag([5.0, 5.0, 0.0]) * 0.05
+        # Original: higher gains
+        K_pos = np.diag([8.2, 10.2, 7.0]) * 1.0
+        K_angular_vel = np.diag([1.0, 1.0, 1.0]) * 0.05
+        K_orient_error = np.diag([5.0, 5.0, 0.0]) * 1.5
         
         desired_position_velocity = K_pos @ position_error
         desired_angular_velocity = (K_orient_error @ orientation_error) - (K_angular_vel @ angular_vel_err)
         desired_cartesian_velocity = np.concatenate([desired_position_velocity, desired_angular_velocity])
         
-        # 5. Compute base position control velocities
         try:
             lambda_damping = 0.25
             J_damped_pinv = J.T @ np.linalg.inv(J @ J.T + lambda_damping * np.eye(6))
@@ -522,52 +633,28 @@ class TorqueBalancingController(BaseController):
         except np.linalg.LinAlgError:
             base_joint_velocities = np.zeros(7)
         
-        # 6. Compute joint torques
         joint_torques = self.compute_joint_torques()
-        
-        # 7. Compute base moment cost using potential field function
         cost, moment_error, cost_data = self.compute_base_moment_cost()
         projected_moment = cost_data['projected_moment']
         tau_6 = cost_data['tau_6']
         tau_7 = cost_data['tau_7']
         
-        # 8. Compute null space moment correction using gradient descent
         moment_correction = self.compute_null_space_torque_correction(joint_torques)
         
-        # 9. Combine base position control with moment balancing
-        # Use velocity commands for primary task, moment corrections in null space
-        max_velocity = 2.0
+        # Original: max_velocity = 4.0
+        max_velocity = 4.0
         base_joint_velocities_clipped = np.clip(base_joint_velocities, -max_velocity, max_velocity)
         
-        # 10. Apply corrections (small corrections to avoid task disruption)
-        correction_scaling = 0.01  # Small scaling factor for moment corrections
+        correction_scaling = 0.01
         final_joint_velocities = base_joint_velocities_clipped + correction_scaling * moment_correction[:7]
         final_joint_velocities = np.clip(final_joint_velocities, -max_velocity, max_velocity)
         
-        # 11. Zero out joint 7 command (reserved for manual control)
+        # Zero out joint 7 (reserved for manual control)
         final_joint_velocities[6] = 0.0
         
-        # 12. Set control commands (respect manual actuator if present)
-        # Use apply_control_vector helper to avoid overwriting manual actuator slider
-        if hasattr(self, 'apply_control_vector'):
-            self.apply_control_vector(final_joint_velocities)
-        else:
-            # Fallback: manually apply control while protecting manual actuator
-            manual_id = getattr(self, 'manual_actuator_id', None)
-            manual_id = 6
-            for i, val in enumerate(final_joint_velocities):
-                if i < len(self.data.ctrl):
-                    if manual_id is not None and i == manual_id:
-                        continue  # Skip manual actuator
-                    self.data.ctrl[i] = float(val)
-            # Zero remaining control entries (except manual actuator)
-            for idx in range(len(final_joint_velocities), len(self.data.ctrl)):
-                if manual_id is not None and idx == manual_id:
-                    continue
-                #print(f"Zeroing ctrl at index {idx}")
-                self.data.ctrl[idx] = 0.0
+        # Apply control
+        self.apply_control_vector(final_joint_velocities)
         
-        # Store target orientation
         self.current_target_orientation = target_orient_mat
         self.previous_position_error = position_error.copy()
         
@@ -598,50 +685,36 @@ class NoControlController(BaseController):
     - Baseline testing and validation
     """
     
+    ROTATION_CORRECTOR = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
+    
     def __init__(self, model, data, **kwargs):
-        """
-        Initialize no-control controller
-        
-        Args:
-            model: MuJoCo model
-            data: MuJoCo data
-            **kwargs: Additional parameters (unused for this controller)
-        """
+        """Initialize no-control controller"""
         super().__init__(model, data)
         self.target_position = None
         self.target_orientation = None
         
     def compute_control(self):
-        """Compute no control - all control signals are zero, joints are completely unactuated"""
+        """Zero all control signals - joints completely unactuated"""
         if not self.enabled:
             return
         
-        # Zero out all control inputs to disable all actuators
-        # This makes the joints completely unactuated and free to move passively
-        self.data.ctrl[:] = 0.0
+        # Zero all control inputs to ensure robot remains static
+        #self.data.ctrl[:] = 0.0
         
-        # Get current state for data collection (but don't control anything)
+        # Get state for monitoring only
         current_pos = self.get_end_effector_position()
         current_orient_mat = self.get_end_effector_orientation()
         self.target_position = self.get_target_position()
         self.target_orientation = self.get_target_orientation()
         current_joint_vel = self.data.qvel[:7]
         
-        # Compute Jacobian for angular velocity calculation
-        J_full = self.compute_jacobian()
-        J_rot = J_full[3:6, :7]
-        current_angular_vel = J_rot @ current_joint_vel
+        J = self.compute_jacobian()
+        current_angular_vel = J[3:6, :7] @ current_joint_vel
         
-        # Calculate errors for monitoring (but not used for control)
-        position_error = self.target_position - current_pos
-        RotationCorrecter = np.array([[0, -1, 1], [0, 0, -1], [-1, 0, 0]])
-        target_orient_mat = RotationCorrecter @ self.target_orientation
-        R_error = current_orient_mat.T @ target_orient_mat
-        orientation_error = np.array([
-            R_error[2, 1] - R_error[1, 2],
-            R_error[0, 2] - R_error[2, 0],
-            R_error[1, 0] - R_error[0, 1]
-        ]) * 0.5
+        # Use shared methods for error calculation
+        position_error = self.compute_position_error(current_pos, self.target_position)
+        target_orient_mat = self.ROTATION_CORRECTOR @ self.target_orientation
+        orientation_error = self.compute_orientation_error(current_orient_mat, target_orient_mat)
         
         return {
             'current_pos': current_pos,
@@ -660,6 +733,7 @@ class ControllerFactory(ABC):
     AVAILABLE_CONTROLLERS = {
         'position': PositionController,
         'torque_balancing': TorqueBalancingController,
+        'old_torque': OldTorqueBalancingController,
         'no_control': NoControlController,
     }
     

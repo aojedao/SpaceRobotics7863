@@ -752,15 +752,28 @@ class IntegratedZeroGravitySimulation:
             viewer.cam.distance=2.249
             viewer.cam.azimuth=0.75
             viewer.cam.elevation=-20.0
-            # Initialize to default position
+            
+            # Reset simulation to initial state and ensure everything is static
             mujoco.mj_resetData(self.model, self.data)
             
-            # Zero all velocities and set all joints to zero position
-            self.data.qvel[:] = 0.0
-            self.data.qpos[:] = 0.0
-            self.data.qpos[3] = 1.0  # Set base quaternion to identity (w=1)
+            # Set proper initial position for robot base (freejoint)
+            # The base freejoint uses qpos[0:3] for position and qpos[3:7] for quaternion
+            # Place base at z=0.15 to avoid floor penetration (floor top is at z=0)
+            self.data.qpos[0] = 0.0   # x position
+            self.data.qpos[1] = 0.0   # y position  
+            self.data.qpos[2] = 0.15  # z position (above floor)
+            self.data.qpos[3] = 1.0   # quaternion w
+            self.data.qpos[4] = 0.0   # quaternion x
+            self.data.qpos[5] = 0.0   # quaternion y
+            self.data.qpos[6] = 0.0   # quaternion z
             
-            # Forward kinematics to update all body positions
+            # Zero ALL velocities (ensures both robot and box are static)
+            self.data.qvel[:] = 0.0
+            
+            # Zero all control inputs
+            self.data.ctrl[:] = 0.0
+            
+            # Forward kinematics to update all body positions without adding velocity
             mujoco.mj_forward(self.model, self.data)
             
             print(f"✓ Robot initialized: Free-floating base (6 DOF), all joints unactuated")
