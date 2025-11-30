@@ -73,7 +73,18 @@ class RobotState3D:
 
 
 class PivotBrachiationRobot3D:
-    """3D two-link brachiation robot with pivot joint."""
+    """
+    3D two-link brachiation robot with pivot joint.
+    
+    CONSTRAINT: One end is ALWAYS anchored (hooked to a hold point).
+    The robot can only move by:
+    1. Swinging theta - rotate in XY plane (azimuth)
+    2. Swinging phi - change elevation angle
+    3. Bending at the pivot joint (changes pivot_angle)
+    4. Switching anchor: free end hooks to a new hold, becomes new anchor (brachiation!)
+    
+    The anchored end is FIXED - only the free end can move!
+    """
     
     def __init__(self, link_length: float = 1.5):
         self.link_length = link_length
@@ -205,6 +216,22 @@ class PivotBrachiationRobot3D:
         new_anchor_end = 'B' if state.anchor_end == 'A' else 'A'
         
         return RobotState3D(new_anchor_pos.copy(), new_theta, new_phi, new_pivot, new_anchor_end)
+    
+    def can_switch_anchor(self, state: RobotState3D, hold_points: List[np.ndarray], 
+                          snap_distance: float = 2.0) -> List[np.ndarray]:
+        """
+        Find ALL hold points near enough to the free end for anchor switching.
+        
+        Returns:
+            List of reachable hold points (may be empty).
+        """
+        free_end = self.get_free_end_position(state)
+        reachable = []
+        for hold in hold_points:
+            dist = np.linalg.norm(free_end - hold)
+            if dist < snap_distance and dist > 0.1:  # Not too close (avoid same point)
+                reachable.append(hold)
+        return reachable
 
 
 # ==============================================================================
@@ -320,43 +347,51 @@ class PivotRRT3D:
         return min(self.nodes, key=dist)
     
     def extend(self, from_node: RRTNode3D, target: RobotState3D) -> Optional[RRTNode3D]:
-        """Extend tree."""
+        """
+        Extend tree toward target.
+        
+        CONSTRAINT: Anchor is FIXED - only free end moves via:
+        1. swing_theta - rotate in XY plane (azimuth)
+        2. swing_phi - change elevation
+        3. bend - pivot joint
+        4. switch - hook free end to new hold, swap anchor (brachiation!)
+        """
         current = from_node.state
         candidates = []
         
-        # Swing theta
+        # Swing theta (only free end moves)
         for _ in range(2):
             delta = random.uniform(-self.theta_step, self.theta_step)
             new_state = self.robot.swing_theta(current, delta)
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'swing_theta'))
         
-        # Swing phi
+        # Swing phi (only free end moves)
         for _ in range(2):
             delta = random.uniform(-self.phi_step, self.phi_step)
             new_state = self.robot.swing_phi(current, delta)
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'swing_phi'))
         
-        # Bend pivot
+        # Bend pivot (only free end moves)
         for _ in range(2):
             delta = random.uniform(-self.pivot_step, self.pivot_step)
             new_state = self.robot.bend_pivot(current, delta)
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'bend'))
         
-        # Switch anchor
-        free_end = self.robot.get_free_end_position(current)
-        for hold in self.env.hold_points:
-            if np.linalg.norm(free_end - hold) < self.hold_snap_dist:
-                new_state = self.robot.switch_anchor(current, hold)
-                if self.env.is_robot_valid(self.robot, new_state):
-                    candidates.append((new_state, 'switch'))
+        # Switch anchor (key brachiation move!)
+        # Find ALL reachable holds for the free end
+        reachable_holds = self.robot.can_switch_anchor(current, self.env.hold_points, self.hold_snap_dist)
+        for hold in reachable_holds:
+            new_state = self.robot.switch_anchor(current, hold)
+            if self.env.is_robot_valid(self.robot, new_state):
+                candidates.append((new_state, 'switch'))
         
         if not candidates:
             return None
         
-        # Prefer switches that get closer
+        # Prefer switches that get closer to goal (key brachiation moves!)
         switches = [(s, a) for s, a in candidates if a == 'switch']
         if switches:
             best = min(switches, key=lambda x: self.distance_to_goal(x[0]))
@@ -435,19 +470,84 @@ def draw_cube_wireframe(ax, size):
 
 
 def draw_robot_3d(ax, robot, state, color='blue', alpha=1.0, lw=3):
-    """Draw robot in 3D."""
+    """Draw robot in 3D, clearly showing ANCHORED vs FREE end."""
     anchor, pivot, free_end = robot.get_all_positions(state)
     
     # Links
     ax.plot3D([anchor[0], pivot[0]], [anchor[1], pivot[1]], [anchor[2], pivot[2]],
              color=color, linewidth=lw, alpha=alpha)
     ax.plot3D([pivot[0], free_end[0]], [pivot[1], free_end[1]], [pivot[2], free_end[2]],
-             color=color, linewidth=lw, alpha=alpha)
+             color='c' if alpha > 0.5 else color, linewidth=lw, alpha=alpha)
     
-    # Joints
+    # Pivot joint (yellow)
     ax.scatter(*pivot, c='yellow', s=60, marker='o', edgecolors='black')
-    ax.scatter(*anchor, c='red', s=80, marker='s', edgecolors='black')
-    ax.scatter(*free_end, c='cyan', s=60, marker='o', edgecolors='black')
+    
+    # ANCHORED end - RED SQUARE (FIXED to hold point!)
+    ax.scatter(*anchor, c='red', s=100, marker='s', edgecolors='darkred')
+    
+    # FREE end - CYAN CIRCLE (can move!)
+    ax.scatter(*free_end, c='cyan', s=80, marker='o', edgecolors='blue')
+
+
+def animate_3d_path(robot, env, path, goal_pos, save_path=None, interval=500):
+    """Create 3D animation of robot path."""
+    from matplotlib.animation import FuncAnimation
+    
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    def setup_frame():
+        ax.clear()
+        draw_cube_wireframe(ax, env.size)
+        ax.scatter(*goal_pos, c='green', s=200, marker='*', zorder=10)
+        
+        # Draw ghost path
+        for node in path:
+            anchor, pivot, free_end = robot.get_all_positions(node.state)
+            ax.plot3D([anchor[0], pivot[0]], [anchor[1], pivot[1]], [anchor[2], pivot[2]],
+                     color='lightgray', linewidth=1, alpha=0.2)
+            ax.plot3D([pivot[0], free_end[0]], [pivot[1], free_end[1]], [pivot[2], free_end[2]],
+                     color='lightgray', linewidth=1, alpha=0.2)
+        
+        ax.set_xlim(0, env.size)
+        ax.set_ylim(0, env.size)
+        ax.set_zlim(0, env.size)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+    
+    def animate(frame):
+        setup_frame()
+        
+        if frame < len(path):
+            state = path[frame].state
+            anchor, pivot, free_end = robot.get_all_positions(state)
+            
+            # Draw links
+            ax.plot3D([anchor[0], pivot[0]], [anchor[1], pivot[1]], [anchor[2], pivot[2]],
+                     'b-', linewidth=5)
+            ax.plot3D([pivot[0], free_end[0]], [pivot[1], free_end[1]], [pivot[2], free_end[2]],
+                     'b-', linewidth=5)
+            
+            # Draw joints
+            ax.scatter(*pivot, c='yellow', s=100, marker='o', edgecolors='black')
+            ax.scatter(*anchor, c='red', s=120, marker='s', edgecolors='black')
+            ax.scatter(*free_end, c='cyan', s=100, marker='o', edgecolors='black')
+            
+            action = path[frame].action if path[frame].action else "START"
+            ax.set_title(f'3D Brachiation - Step {frame+1}/{len(path)} - {action}')
+        
+        return []
+    
+    anim = FuncAnimation(fig, animate, frames=len(path), interval=interval, 
+                        blit=False, repeat=True)
+    
+    if save_path:
+        print(f"Saving 3D animation to {save_path}...")
+        anim.save(save_path, writer='pillow', fps=1000//interval)
+        print(f"Animation saved!")
+    
+    return fig, anim
 
 
 def test_3d_goal(robot, env, start_state, goal_pos, goal_num):
@@ -521,7 +621,15 @@ def run_3d_multi_goal_test():
     print(f"3D SUMMARY: {successes}/{len(goals)} goals reached")
     print('='*60)
     
-    # Visualization
+    # Generate animations for each goal
+    print("\nGenerating 3D animations...")
+    for i, (path, goal) in enumerate(all_paths):
+        if path:
+            fig, anim = animate_3d_path(robot, env, path, goal,
+                save_path=f'brachiation_3d_goal{i+1}.gif', interval=600)
+            plt.close(fig)
+    
+    # Visualization - static summary
     fig = plt.figure(figsize=(18, 6))
     
     for i, (path, goal) in enumerate(all_paths):

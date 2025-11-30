@@ -75,10 +75,16 @@ class PivotBrachiationRobot:
     """
     Two-link brachiation robot with a pivot joint in the middle.
     
+    CONSTRAINT: One end is ALWAYS anchored (hooked to a hold point).
+    The robot can only move by:
+    1. Swinging around the anchored point (changing base_angle)
+    2. Bending at the pivot joint (changing pivot_angle)
+    3. Switching anchor: free end hooks to a new hold, becomes new anchor
+    
     Structure:
-        End A ----[Link 1]---- Pivot ----[Link 2]---- End B
-        
-    The pivot joint allows link 2 to rotate relative to link 1.
+        [ANCHORED] End A ----[Link 1]---- Pivot ----[Link 2]---- End B [FREE]
+        or
+        [FREE] End A ----[Link 1]---- Pivot ----[Link 2]---- End B [ANCHORED]
     """
     
     def __init__(self, link_length: float = 1.5):
@@ -87,6 +93,7 @@ class PivotBrachiationRobot:
     
     def get_pivot_position(self, state: RobotState) -> np.ndarray:
         """Get position of the central pivot joint."""
+        # Pivot is always link_length away from the ANCHORED end
         offset = self.link_length * np.array([
             np.cos(state.base_angle), 
             np.sin(state.base_angle)
@@ -105,27 +112,33 @@ class PivotBrachiationRobot:
         return pivot + offset
     
     def get_all_positions(self, state: RobotState) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Get positions of anchor, pivot, and free end."""
-        anchor = state.anchor_pos.copy()
+        """Get positions of anchor (FIXED), pivot, and free end (MOVABLE)."""
+        anchor = state.anchor_pos.copy()  # This is FIXED - hooked to hold
         pivot = self.get_pivot_position(state)
-        free_end = self.get_free_end_position(state)
+        free_end = self.get_free_end_position(state)  # This can move
         return anchor, pivot, free_end
     
     def get_end_positions(self, state: RobotState) -> Tuple[np.ndarray, np.ndarray]:
         """Get positions of End A and End B."""
         anchor, pivot, free_end = self.get_all_positions(state)
         if state.anchor_end == 'A':
-            return anchor, free_end
+            return anchor, free_end  # A is anchored, B is free
         else:
-            return free_end, anchor
+            return free_end, anchor  # B is anchored, A is free
     
     def swing_base(self, state: RobotState, delta_angle: float) -> RobotState:
-        """Swing the robot by changing base angle (pivot stays fixed)."""
+        """
+        Swing the robot by changing base angle.
+        The ANCHOR stays FIXED - only the free end moves in an arc.
+        """
         new_base = state.base_angle + delta_angle
         return RobotState(state.anchor_pos.copy(), new_base, state.pivot_angle, state.anchor_end)
     
     def bend_pivot(self, state: RobotState, delta_angle: float) -> RobotState:
-        """Bend the pivot joint by changing pivot angle."""
+        """
+        Bend the pivot joint by changing pivot angle.
+        The ANCHOR stays FIXED - only affects the free end position.
+        """
         new_pivot = np.clip(
             state.pivot_angle + delta_angle, 
             self.pivot_range[0], 
@@ -133,10 +146,30 @@ class PivotBrachiationRobot:
         )
         return RobotState(state.anchor_pos.copy(), state.base_angle, new_pivot, state.anchor_end)
     
+    def can_switch_anchor(self, state: RobotState, hold_points: List[np.ndarray], 
+                          snap_distance: float = 1.5) -> List[np.ndarray]:
+        """
+        Find ALL hold points near enough to the free end for anchor switching.
+        
+        Returns:
+            List of reachable hold points (may be empty).
+        """
+        free_end = self.get_free_end_position(state)
+        reachable = []
+        for hold in hold_points:
+            dist = np.linalg.norm(free_end - hold)
+            if dist < snap_distance and dist > 0.1:  # Not too close (avoid same point)
+                reachable.append(hold)
+        return reachable
+    
     def switch_anchor(self, state: RobotState, new_anchor_pos: np.ndarray) -> RobotState:
         """
-        Switch which end is anchored.
-        The free end becomes anchored at new_anchor_pos.
+        Switch which end is anchored (the brachiation move!).
+        
+        The FREE end hooks onto a new hold point and becomes the new ANCHOR.
+        The old anchor becomes the new free end.
+        
+        This is the key move for brachiation - like a gibbon swinging through trees.
         """
         old_anchor = state.anchor_pos
         old_pivot = self.get_pivot_position(state)
@@ -145,15 +178,17 @@ class PivotBrachiationRobot:
         direction_to_pivot = old_pivot - new_anchor_pos
         new_base_angle = np.arctan2(direction_to_pivot[1], direction_to_pivot[0])
         
-        # New pivot angle: from new link1 to old anchor direction
+        # New pivot angle: maintains the configuration but from new perspective
         direction_to_old_anchor = old_anchor - old_pivot
         old_anchor_angle = np.arctan2(direction_to_old_anchor[1], direction_to_old_anchor[0])
         new_pivot_angle = self._normalize_angle(old_anchor_angle - new_base_angle)
         
-        # Clamp pivot angle
+        # Clamp pivot angle to valid range
         new_pivot_angle = np.clip(new_pivot_angle, self.pivot_range[0], self.pivot_range[1])
         
+        # Switch the anchor designation
         new_anchor_end = 'B' if state.anchor_end == 'A' else 'A'
+        
         return RobotState(new_anchor_pos.copy(), new_base_angle, new_pivot_angle, new_anchor_end)
     
     @staticmethod
@@ -269,7 +304,7 @@ class PivotRRT:
         self.max_iterations = 3000
         self.base_step = np.pi / 4
         self.pivot_step = np.pi / 6
-        self.hold_snap_distance = 2.0
+        self.hold_snap_distance = 2.5  # Distance to snap to hold points for switching
         self.goal_bias = 0.35
         
         self.nodes: List[RRTNode] = []
@@ -328,11 +363,18 @@ class PivotRRT:
         return diff
     
     def extend(self, from_node: RRTNode, target: RobotState) -> Optional[RRTNode]:
-        """Try to extend tree toward target."""
+        """
+        Try to extend tree toward target.
+        
+        CONSTRAINT: The anchor point is FIXED. Only the free end can move via:
+        1. swing - rotate around anchor (changes base_angle)
+        2. bend  - bend at pivot joint (changes pivot_angle)  
+        3. switch - hook free end to new hold, swap anchor (brachiation!)
+        """
         current = from_node.state
         candidates = []
         
-        # Action 1: Swing base
+        # Action 1: Swing around anchor (only free end moves)
         base_diff = self._angle_diff(current.base_angle, target.base_angle)
         if abs(base_diff) > 0.01:
             step = np.sign(base_diff) * min(abs(base_diff), self.base_step)
@@ -340,14 +382,14 @@ class PivotRRT:
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'swing'))
         
-        # Random swing
+        # Random swings for exploration
         for _ in range(2):
             step = random.uniform(-self.base_step, self.base_step)
             new_state = self.robot.swing_base(current, step)
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'swing'))
         
-        # Action 2: Bend pivot
+        # Action 2: Bend pivot joint (only free end moves)
         pivot_diff = target.pivot_angle - current.pivot_angle
         if abs(pivot_diff) > 0.01:
             step = np.sign(pivot_diff) * min(abs(pivot_diff), self.pivot_step)
@@ -355,32 +397,32 @@ class PivotRRT:
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'bend'))
         
-        # Random bend
+        # Random bends
         for _ in range(2):
             step = random.uniform(-self.pivot_step, self.pivot_step)
             new_state = self.robot.bend_pivot(current, step)
             if self.env.is_robot_valid(self.robot, new_state):
                 candidates.append((new_state, 'bend'))
         
-        # Action 3: Switch anchor
-        free_end = self.robot.get_free_end_position(current)
-        for hold in self.env.hold_points:
-            if np.linalg.norm(free_end - hold) < self.hold_snap_distance:
-                new_state = self.robot.switch_anchor(current, hold)
-                if self.env.is_robot_valid(self.robot, new_state):
-                    candidates.append((new_state, 'switch'))
+        # Action 3: Switch anchor (ONLY if free end is near a hold point!)
+        # This is the brachiation move - free end hooks, becomes new anchor
+        reachable_holds = self.robot.can_switch_anchor(current, self.env.hold_points, self.hold_snap_distance)
+        for hold in reachable_holds:
+            new_state = self.robot.switch_anchor(current, hold)
+            if self.env.is_robot_valid(self.robot, new_state):
+                candidates.append((new_state, 'switch'))  # Key brachiation move!
         
         if not candidates:
             return None
         
-        # Prefer switches that reduce distance to goal
+        # Prefer switches that reduce distance to goal (key brachiation moves!)
         switches = [(s, a) for s, a in candidates if a == 'switch']
         if switches:
             best_switch = min(switches, key=lambda x: self.distance_to_goal(x[0]))
             if self.distance_to_goal(best_switch[0]) < self.distance_to_goal(current) - 0.1:
                 return RRTNode(best_switch[0], from_node, best_switch[1])
         
-        # Otherwise pick best
+        # Otherwise pick best candidate
         best = min(candidates, key=lambda x: self.distance_to_goal(x[0]))
         return RRTNode(best[0], from_node, best[1])
     
@@ -475,7 +517,7 @@ class Visualizer:
         return fig, ax
     
     def draw_robot(self, ax, state: RobotState, color='blue', alpha=1.0, lw=3):
-        """Draw robot at state."""
+        """Draw robot at state, clearly showing ANCHORED vs FREE end."""
         anchor, pivot, free_end = self.robot.get_all_positions(state)
         
         # Draw links
@@ -484,10 +526,16 @@ class Visualizer:
         ax.plot([pivot[0], free_end[0]], [pivot[1], free_end[1]], 
                color=color, linewidth=lw, alpha=alpha)
         
-        # Draw joints
+        # Draw pivot joint (yellow circle)
         ax.scatter(*pivot, c='yellow', s=80, marker='o', edgecolors='black', zorder=5)
-        ax.scatter(*anchor, c='red', s=100, marker='s', edgecolors='black', zorder=5)
-        ax.scatter(*free_end, c='cyan', s=80, marker='o', edgecolors='black', zorder=5)
+        
+        # Draw ANCHORED end - RED SQUARE (this is FIXED to a hold point!)
+        ax.scatter(*anchor, c='red', s=120, marker='s', edgecolors='darkred', 
+                  linewidths=2, zorder=6, label='Anchored (fixed)')
+        
+        # Draw FREE end - CYAN CIRCLE (this can move!)
+        ax.scatter(*free_end, c='cyan', s=100, marker='o', edgecolors='blue', 
+                  linewidths=2, zorder=5, label='Free (movable)')
     
     def draw_path(self, ax, path: List[RRTNode]):
         """Draw the planned path."""
@@ -500,6 +548,80 @@ class Visualizer:
         if path:
             self.draw_robot(ax, path[0].state, color='green', lw=4)
             self.draw_robot(ax, path[-1].state, color='red', lw=4)
+    
+    def animate_path(self, path: List[RRTNode], goal_pos: np.ndarray, 
+                     save_path: str = None, interval: int = 400):
+        """Create animation of robot following the path."""
+        fig, ax = self.setup_plot(goal_pos)
+        
+        # Draw ghost path
+        for node in path:
+            self.draw_robot(ax, node.state, color='lightgray', alpha=0.15, lw=1)
+        
+        # Animation elements storage
+        lines = []
+        points = []
+        
+        def init():
+            return []
+        
+        def animate(frame):
+            nonlocal lines, points
+            # Clear previous
+            for l in lines:
+                l.remove()
+            for p in points:
+                p.remove()
+            lines = []
+            points = []
+            
+            if frame < len(path):
+                state = path[frame].state
+                anchor, pivot, free_end = self.robot.get_all_positions(state)
+                
+                # Draw links with different colors
+                l1, = ax.plot([anchor[0], pivot[0]], [anchor[1], pivot[1]], 
+                             'b-', linewidth=5, zorder=10)
+                l2, = ax.plot([pivot[0], free_end[0]], [pivot[1], free_end[1]], 
+                             'c-', linewidth=5, zorder=10)
+                lines.extend([l1, l2])
+                
+                # Draw pivot joint (yellow)
+                p1 = ax.scatter(*pivot, c='yellow', s=120, marker='o', 
+                               edgecolors='black', linewidths=2, zorder=11)
+                
+                # ANCHORED end - RED SQUARE (FIXED to hold point!)
+                p2 = ax.scatter(*anchor, c='red', s=180, marker='s', 
+                               edgecolors='darkred', linewidths=3, zorder=12)
+                
+                # FREE end - CYAN CIRCLE (can move)
+                p3 = ax.scatter(*free_end, c='cyan', s=140, marker='o', 
+                               edgecolors='blue', linewidths=2, zorder=11)
+                points.extend([p1, p2, p3])
+                
+                # Title with action and anchor info
+                action = path[frame].action if path[frame].action else "START"
+                anchor_label = f"Anchor: End {state.anchor_end}"
+                
+                # Special highlight for anchor switches
+                if action == "switch":
+                    ax.set_title(f'Step {frame+1}/{len(path)} - ⚡ SWITCH ANCHOR ⚡ | {anchor_label}',
+                                fontsize=11, fontweight='bold', color='red')
+                else:
+                    ax.set_title(f'Step {frame+1}/{len(path)} - {action} | {anchor_label}', fontsize=10)
+            
+            return lines + points
+        
+        from matplotlib.animation import FuncAnimation
+        anim = FuncAnimation(fig, animate, init_func=init, frames=len(path),
+                            interval=interval, blit=False, repeat=True)
+        
+        if save_path:
+            print(f"Saving animation to {save_path}...")
+            anim.save(save_path, writer='pillow', fps=1000//interval)
+            print(f"Animation saved!")
+        
+        return fig, anim
 
 
 # ==============================================================================
@@ -595,7 +717,16 @@ def run_multi_goal_test():
     print(f"SUMMARY: {successes}/{len(goals)} goals reached")
     print('='*60)
     
-    # Visualization
+    # Create animations for each goal
+    print("\nGenerating animations...")
+    for i, (path, goal) in enumerate(zip(all_paths, goals)):
+        if path:
+            vis = Visualizer(robot, env)
+            fig, anim = vis.animate_path(path, goal, 
+                save_path=f'brachiation_2d_goal{i+1}.gif', interval=500)
+            plt.close(fig)
+    
+    # Visualization - static summary
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
     for i, (path, goal) in enumerate(zip(all_paths, goals)):
