@@ -22,7 +22,7 @@ from controller import ControllerFactory
 class IntegratedZeroGravitySimulation:
     def __init__(self, 
                  iiwa_model_path="kuka_iiwa_14/iiwa14.xml",
-                 door_model_path="door_hinge_model.xml",
+                 door_model_path="archive/old_configs/door_hinge_model.xml",
                  controller_type='position'):
         """
         Initialize the integrated simulation using original iiwa14 + extensions
@@ -181,11 +181,11 @@ class IntegratedZeroGravitySimulation:
     <mesh name="spring_link" file="robotiq_2f85/assets/spring_link.stl" scale="0.001 0.001 0.001"/>
 
     <!-- Box/Door meshes -->
-    <mesh name="Box" file="Box.stl"/>
-    <mesh name="Door" file="Door.stl"/>
+    <mesh name="Box" file="stl_models/Box.stl"/>
+    <mesh name="Door" file="stl_models/Door.stl"/>
 
     <!-- Environment Meshes -->
-    <mesh name="ISSDestiny" file="ISSArea1.stl" scale="0.1 0.1 0.1" />
+    <mesh name="ISSDestiny" file="stl_models/ISSArea1.stl" scale="0.1 0.1 0.1" />
 
     <!-- Environment textures -->
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
