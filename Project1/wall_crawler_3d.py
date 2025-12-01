@@ -363,9 +363,10 @@ class WallCrawlerVisualizer3D:
                                    edgecolor='black', linewidth=1)
             self.ax.add_collection3d(poly)
         
-        # Draw grid points on walls
-        for (pos, wall) in self.planner.wall_positions:
-            self.ax.scatter(*pos, c='gray', s=5, alpha=0.3)
+        # Draw grid points on walls - USE SINGLE BATCH CALL for performance
+        all_positions = np.array([pos for (pos, wall) in self.planner.wall_positions])
+        self.ax.scatter(all_positions[:, 0], all_positions[:, 1], all_positions[:, 2], 
+                       c='gray', s=5, alpha=0.3)
     
     def draw_path_line(self, path: List[CrawlerState3D]):
         """Draw the planned path as a 3D line"""
