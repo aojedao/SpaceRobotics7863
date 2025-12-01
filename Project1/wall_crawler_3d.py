@@ -513,7 +513,7 @@ class WallCrawlerVisualizer3D:
         plt.ion()
         plt.tight_layout()
         plt.show(block=False)
-        plt.pause(0.3)
+        plt.pause(0.1)
         
         robot_elements = []
         self._legend_added = False
@@ -565,7 +565,7 @@ class WallCrawlerVisualizer3D:
     
     def _save_animation_gif(self, path: List[CrawlerState3D], save_file: str, base_azim: float):
         """Save the animation as a GIF file by saving individual frames"""
-        import imageio
+        import imageio.v2 as imageio
         import tempfile
         import os
         

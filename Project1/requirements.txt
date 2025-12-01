@@ -1,0 +1,15 @@
+# Space Robotics Project 1 - Requirements
+# KUKA iiwa14 Robot Controller and Brachiation Simulation
+
+# Core simulation
+mujoco>=3.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Visualization and animation
+matplotlib>=3.7.0
+pillow>=10.0.0
+imageio>=2.35.0
+
+# Optional: for enhanced 3D visualization
+# mujoco-python-viewer>=0.1.0
