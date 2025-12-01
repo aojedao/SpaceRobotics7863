@@ -489,9 +489,108 @@ def draw_robot_3d(ax, robot, state, color='blue', alpha=1.0, lw=3):
     ax.scatter(*free_end, c='cyan', s=80, marker='o', edgecolors='blue')
 
 
-def animate_3d_path(robot, env, path, goal_pos, save_path=None, interval=500):
-    """Create 3D animation of robot path."""
+def interpolate_3d_states(state1: RobotState3D, state2: RobotState3D, 
+                          action: str, num_steps: int = 12) -> List[Tuple[RobotState3D, str]]:
+    """
+    Interpolate between two 3D states to create smooth animation frames.
+    
+    For switch actions, we show the approach and then the switch.
+    For swing/bend, we interpolate angles smoothly.
+    """
+    frames = []
+    
+    if action == 'switch':
+        # For switches, show approach then switch
+        for i in range(num_steps // 2):
+            frames.append((state1.copy(), "approaching hold"))
+        for i in range(num_steps // 2):
+            frames.append((state2.copy(), "SWITCHED!"))
+    else:
+        # Interpolate all angles smoothly
+        for i in range(num_steps):
+            t = i / max(num_steps - 1, 1)
+            
+            # Interpolate theta (handle wraparound)
+            theta_diff = state2.base_theta - state1.base_theta
+            while theta_diff > np.pi: theta_diff -= 2*np.pi
+            while theta_diff < -np.pi: theta_diff += 2*np.pi
+            
+            interp_theta = state1.base_theta + t * theta_diff
+            interp_phi = state1.base_phi + t * (state2.base_phi - state1.base_phi)
+            interp_pivot = state1.pivot_angle + t * (state2.pivot_angle - state1.pivot_angle)
+            
+            interp_state = RobotState3D(
+                state1.anchor_pos.copy(),
+                interp_theta,
+                interp_phi,
+                interp_pivot,
+                state1.anchor_end
+            )
+            
+            # Describe the motion
+            if abs(theta_diff) > 0.01:
+                phase = "rotating XY"
+            elif abs(state2.base_phi - state1.base_phi) > 0.01:
+                phase = "tilting"
+            elif abs(state2.pivot_angle - state1.pivot_angle) > 0.01:
+                phase = "bending"
+            else:
+                phase = action
+                
+            frames.append((interp_state, phase))
+    
+    return frames
+
+
+def create_smooth_3d_frames(robot, path: List[RRTNode3D], 
+                            frames_per_step: int = 12) -> List[Tuple[RobotState3D, str, int]]:
+    """
+    Create smooth animation frames from 3D RRT path.
+    """
+    all_frames = []
+    
+    if not path:
+        return all_frames
+    
+    # Add initial state
+    all_frames.append((path[0].state.copy(), "START", 0))
+    
+    for i in range(1, len(path)):
+        prev_state = path[i-1].state
+        curr_state = path[i].state
+        action = path[i].action if path[i].action else "move"
+        
+        # Interpolate between states
+        interp_frames = interpolate_3d_states(prev_state, curr_state, action, frames_per_step)
+        
+        for state, phase in interp_frames:
+            all_frames.append((state, f"{action}: {phase}", i))
+    
+    # Add frames at end
+    for _ in range(frames_per_step // 2):
+        all_frames.append((path[-1].state.copy(), "GOAL REACHED!", len(path)-1))
+    
+    return all_frames
+
+
+def animate_3d_path(robot, env, path, goal_pos, save_path=None, interval=30, frames_per_step=8):
+    """
+    Create SMOOTH 3D animation of robot path with arc visualization.
+    
+    This version interpolates between RRT waypoints to show continuous motion
+    and draws swing arcs on every frame.
+    
+    Args:
+        interval: Animation interval in ms (lower = faster). Default 30ms.
+        frames_per_step: Frames per RRT step. Default 8 (reduced for speed).
+    """
     from matplotlib.animation import FuncAnimation
+    
+    # Create smooth frames
+    smooth_frames = create_smooth_3d_frames(robot, path, frames_per_step)
+    total_frames = len(smooth_frames)
+    
+    print(f"  Creating smooth 3D animation: {len(path)} steps -> {total_frames} frames")
     
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -501,13 +600,13 @@ def animate_3d_path(robot, env, path, goal_pos, save_path=None, interval=500):
         draw_cube_wireframe(ax, env.size)
         ax.scatter(*goal_pos, c='green', s=200, marker='*', zorder=10)
         
-        # Draw ghost path
+        # Draw ghost of final path lightly
         for node in path:
             anchor, pivot, free_end = robot.get_all_positions(node.state)
             ax.plot3D([anchor[0], pivot[0]], [anchor[1], pivot[1]], [anchor[2], pivot[2]],
-                     color='lightgray', linewidth=1, alpha=0.2)
+                     color='lightgray', linewidth=1, alpha=0.15)
             ax.plot3D([pivot[0], free_end[0]], [pivot[1], free_end[1]], [pivot[2], free_end[2]],
-                     color='lightgray', linewidth=1, alpha=0.2)
+                     color='lightgray', linewidth=1, alpha=0.15)
         
         ax.set_xlim(0, env.size)
         ax.set_ylim(0, env.size)
@@ -516,30 +615,95 @@ def animate_3d_path(robot, env, path, goal_pos, save_path=None, interval=500):
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
     
-    def animate(frame):
+    def animate(frame_idx):
         setup_frame()
         
-        if frame < len(path):
-            state = path[frame].state
+        if frame_idx < total_frames:
+            state, action_desc, step_num = smooth_frames[frame_idx]
             anchor, pivot, free_end = robot.get_all_positions(state)
             
-            # Draw links
+            # ===== DRAW 3D SWING ARCS =====
+            # Calculate the distance from anchor to free end (arc radius)
+            arc_r_free = np.linalg.norm(free_end - anchor)
+            arc_r_pivot = np.linalg.norm(pivot - anchor)
+            
+            # Draw a sphere wireframe showing possible positions (simplified as circles in 3 planes)
+            # XY plane circle (green)
+            theta_xy = np.linspace(0, 2*np.pi, 60)
+            arc_xy_x = anchor[0] + arc_r_free * np.cos(theta_xy)
+            arc_xy_y = anchor[1] + arc_r_free * np.sin(theta_xy)
+            arc_xy_z = np.full_like(theta_xy, anchor[2])
+            ax.plot3D(arc_xy_x, arc_xy_y, arc_xy_z, 'g--', linewidth=1.5, alpha=0.4)
+            
+            # XZ plane circle (blue)
+            theta_xz = np.linspace(0, 2*np.pi, 60)
+            arc_xz_x = anchor[0] + arc_r_free * np.cos(theta_xz)
+            arc_xz_y = np.full_like(theta_xz, anchor[1])
+            arc_xz_z = anchor[2] + arc_r_free * np.sin(theta_xz)
+            ax.plot3D(arc_xz_x, arc_xz_y, arc_xz_z, 'b--', linewidth=1.5, alpha=0.4)
+            
+            # YZ plane circle (magenta)
+            theta_yz = np.linspace(0, 2*np.pi, 60)
+            arc_yz_x = np.full_like(theta_yz, anchor[0])
+            arc_yz_y = anchor[1] + arc_r_free * np.cos(theta_yz)
+            arc_yz_z = anchor[2] + arc_r_free * np.sin(theta_yz)
+            ax.plot3D(arc_yz_x, arc_yz_y, arc_yz_z, 'm--', linewidth=1.5, alpha=0.4)
+            
+            # Draw highlighted arc segment near current position
+            # Direction from anchor to free end
+            direction = free_end - anchor
+            if np.linalg.norm(direction) > 0.01:
+                direction = direction / np.linalg.norm(direction)
+                
+                # Create arc around current position
+                # Find perpendicular vectors
+                if abs(direction[2]) < 0.9:
+                    perp1 = np.cross(direction, np.array([0, 0, 1]))
+                else:
+                    perp1 = np.cross(direction, np.array([1, 0, 0]))
+                perp1 = perp1 / np.linalg.norm(perp1)
+                perp2 = np.cross(direction, perp1)
+                
+                # Draw highlighted arc (lime green, thicker)
+                arc_angles = np.linspace(-0.5, 0.5, 30)
+                highlight_x = []
+                highlight_y = []
+                highlight_z = []
+                for angle in arc_angles:
+                    point = anchor + arc_r_free * (np.cos(angle) * direction + np.sin(angle) * perp1)
+                    highlight_x.append(point[0])
+                    highlight_y.append(point[1])
+                    highlight_z.append(point[2])
+                ax.plot3D(highlight_x, highlight_y, highlight_z, color='lime', linewidth=4, alpha=0.8)
+            
+            # Draw links with different colors
             ax.plot3D([anchor[0], pivot[0]], [anchor[1], pivot[1]], [anchor[2], pivot[2]],
                      'b-', linewidth=5)
             ax.plot3D([pivot[0], free_end[0]], [pivot[1], free_end[1]], [pivot[2], free_end[2]],
-                     'b-', linewidth=5)
+                     'c-', linewidth=5)
             
-            # Draw joints
+            # Draw pivot (yellow)
             ax.scatter(*pivot, c='yellow', s=100, marker='o', edgecolors='black')
-            ax.scatter(*anchor, c='red', s=120, marker='s', edgecolors='black')
-            ax.scatter(*free_end, c='cyan', s=100, marker='o', edgecolors='black')
+            # Anchor (red square - FIXED)
+            ax.scatter(*anchor, c='red', s=140, marker='s', edgecolors='darkred')
+            # Free end (cyan - movable)
+            ax.scatter(*free_end, c='cyan', s=100, marker='o', edgecolors='blue')
             
-            action = path[frame].action if path[frame].action else "START"
-            ax.set_title(f'3D Brachiation - Step {frame+1}/{len(path)} - {action}')
+            # Title with action info
+            anchor_label = f"Anchor: End {state.anchor_end}"
+            
+            if "SWITCH" in action_desc.upper():
+                ax.set_title(f'Step {step_num+1}/{len(path)} - ** {action_desc} ** | {anchor_label}',
+                            fontsize=10, fontweight='bold', color='red')
+            elif "GOAL" in action_desc:
+                ax.set_title(f'** {action_desc} ** | {anchor_label}',
+                            fontsize=11, fontweight='bold', color='green')
+            else:
+                ax.set_title(f'Step {step_num+1}/{len(path)} - {action_desc} | {anchor_label}', fontsize=9)
         
         return []
     
-    anim = FuncAnimation(fig, animate, frames=len(path), interval=interval, 
+    anim = FuncAnimation(fig, animate, frames=total_frames, interval=interval, 
                         blit=False, repeat=True)
     
     if save_path:

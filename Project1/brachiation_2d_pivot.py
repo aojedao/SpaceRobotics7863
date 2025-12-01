@@ -549,71 +549,232 @@ class Visualizer:
             self.draw_robot(ax, path[0].state, color='green', lw=4)
             self.draw_robot(ax, path[-1].state, color='red', lw=4)
     
+    def interpolate_states(self, state1: RobotState, state2: RobotState, 
+                           action: str, num_steps: int = 10) -> List[Tuple[RobotState, str]]:
+        """
+        Interpolate between two states to create smooth animation frames.
+        
+        For switch actions, we show:
+        1. Free end approaching the new hold
+        2. The actual switch (anchor swap)
+        3. Brief pause at new configuration
+        
+        For swing/bend, we interpolate angles smoothly.
+        """
+        frames = []
+        
+        if action == 'switch':
+            # For switches, we need special handling since anchor changes
+            # Show the approach, then the switch
+            # First half: show state1 (approaching)
+            for i in range(num_steps // 2):
+                frames.append((state1.copy(), f"approaching hold"))
+            # Second half: show state2 (after switch)
+            for i in range(num_steps // 2):
+                frames.append((state2.copy(), f"SWITCHED!"))
+        else:
+            # Interpolate base_angle and pivot_angle smoothly
+            for i in range(num_steps):
+                t = i / max(num_steps - 1, 1)  # 0 to 1
+                
+                # Interpolate angles (handle wraparound for base_angle)
+                base_diff = state2.base_angle - state1.base_angle
+                # Normalize to [-pi, pi]
+                while base_diff > np.pi: base_diff -= 2*np.pi
+                while base_diff < -np.pi: base_diff += 2*np.pi
+                
+                interp_base = state1.base_angle + t * base_diff
+                interp_pivot = state1.pivot_angle + t * (state2.pivot_angle - state1.pivot_angle)
+                
+                interp_state = RobotState(
+                    state1.anchor_pos.copy(),  # Anchor doesn't change during swing/bend
+                    interp_base,
+                    interp_pivot,
+                    state1.anchor_end
+                )
+                
+                # Describe the motion
+                if abs(base_diff) > 0.01:
+                    phase = "swinging"
+                elif abs(state2.pivot_angle - state1.pivot_angle) > 0.01:
+                    phase = "bending"
+                else:
+                    phase = action
+                    
+                frames.append((interp_state, phase))
+        
+        return frames
+    
+    def create_smooth_animation_frames(self, path: List[RRTNode], 
+                                        frames_per_step: int = 12) -> List[Tuple[RobotState, str, int]]:
+        """
+        Create smooth animation frames from RRT path by interpolating between waypoints.
+        
+        Returns list of (state, action_description, step_number) tuples.
+        """
+        all_frames = []
+        
+        if not path:
+            return all_frames
+        
+        # Add initial state
+        all_frames.append((path[0].state.copy(), "START", 0))
+        
+        for i in range(1, len(path)):
+            prev_state = path[i-1].state
+            curr_state = path[i].state
+            action = path[i].action if path[i].action else "move"
+            
+            # Interpolate between states
+            interp_frames = self.interpolate_states(prev_state, curr_state, action, frames_per_step)
+            
+            for state, phase in interp_frames:
+                all_frames.append((state, f"{action}: {phase}", i))
+        
+        # Add a few frames at the end to show final position
+        for _ in range(frames_per_step // 2):
+            all_frames.append((path[-1].state.copy(), "GOAL REACHED!", len(path)-1))
+        
+        return all_frames
+
     def animate_path(self, path: List[RRTNode], goal_pos: np.ndarray, 
-                     save_path: str = None, interval: int = 400):
-        """Create animation of robot following the path."""
+                     save_path: str = None, interval: int = 50, frames_per_step: int = 15):
+        """
+        Create SMOOTH animation of robot following the path.
+        
+        This version interpolates between RRT waypoints to show continuous motion
+        without any jumping between steps. Shows rotation direction with arrows.
+        
+        Args:
+            path: List of RRT nodes representing the path
+            goal_pos: Goal position for display
+            save_path: Optional path to save GIF
+            interval: Milliseconds between frames (lower = faster)
+            frames_per_step: Number of interpolation frames per RRT step (default 15 for smooth motion)
+        """
         fig, ax = self.setup_plot(goal_pos)
         
-        # Draw ghost path
-        for node in path:
-            self.draw_robot(ax, node.state, color='lightgray', alpha=0.15, lw=1)
+        # Create smooth frames
+        smooth_frames = self.create_smooth_animation_frames(path, frames_per_step)
+        total_frames = len(smooth_frames)
         
-        # Animation elements storage
-        lines = []
+        print(f"  Creating smooth animation: {len(path)} steps -> {total_frames} frames")
+        
+        # Draw ghost of final path lightly
+        for node in path:
+            self.draw_robot(ax, node.state, color='lightgray', alpha=0.1, lw=1)
+        
+        # Animation elements storage - use separate lists for different element types
+        robot_lines = []
+        arc_lines = []
         points = []
+        arrows = []
+        prev_free_end = [None]  # Use list to avoid nonlocal issues
+        
+        # Pre-create arc line objects that will be updated each frame
+        arc_full_line, = ax.plot([], [], color='green', linestyle='--', linewidth=2, alpha=0.5, zorder=3)
+        arc_highlight_line, = ax.plot([], [], color='lime', linestyle='-', linewidth=5, alpha=0.9, zorder=4)
+        arc_pivot_line, = ax.plot([], [], color='magenta', linestyle='--', linewidth=3, alpha=0.7, zorder=4)
+        
+        # Pre-create robot link lines
+        link1_line, = ax.plot([], [], 'b-', linewidth=6, zorder=10, solid_capstyle='round')
+        link2_line, = ax.plot([], [], 'c-', linewidth=6, zorder=10, solid_capstyle='round')
+        
+        # Pre-create joint scatter plots
+        pivot_point = ax.scatter([], [], c='yellow', s=150, marker='o', edgecolors='black', linewidths=2, zorder=11)
+        anchor_point = ax.scatter([], [], c='red', s=200, marker='s', edgecolors='darkred', linewidths=3, zorder=12)
+        free_point = ax.scatter([], [], c='cyan', s=160, marker='o', edgecolors='blue', linewidths=2, zorder=11)
         
         def init():
-            return []
+            arc_full_line.set_data([], [])
+            arc_highlight_line.set_data([], [])
+            arc_pivot_line.set_data([], [])
+            link1_line.set_data([], [])
+            link2_line.set_data([], [])
+            pivot_point.set_offsets(np.empty((0, 2)))
+            anchor_point.set_offsets(np.empty((0, 2)))
+            free_point.set_offsets(np.empty((0, 2)))
+            return [arc_full_line, arc_highlight_line, arc_pivot_line, link1_line, link2_line, 
+                    pivot_point, anchor_point, free_point]
         
-        def animate(frame):
-            nonlocal lines, points
-            # Clear previous
-            for l in lines:
-                l.remove()
-            for p in points:
-                p.remove()
-            lines = []
-            points = []
+        def animate(frame_idx):
+            # Clear arrows from previous frame
+            for a in arrows:
+                try:
+                    a.remove()
+                except:
+                    pass
+            arrows.clear()
             
-            if frame < len(path):
-                state = path[frame].state
+            if frame_idx < total_frames:
+                state, action_desc, step_num = smooth_frames[frame_idx]
                 anchor, pivot, free_end = self.robot.get_all_positions(state)
                 
-                # Draw links with different colors
-                l1, = ax.plot([anchor[0], pivot[0]], [anchor[1], pivot[1]], 
-                             'b-', linewidth=5, zorder=10)
-                l2, = ax.plot([pivot[0], free_end[0]], [pivot[1], free_end[1]], 
-                             'c-', linewidth=5, zorder=10)
-                lines.extend([l1, l2])
+                # ===== UPDATE ARCS FOR EVERY FRAME =====
+                arc_r_free = np.linalg.norm(free_end - anchor)
+                arc_r_pivot = np.linalg.norm(pivot - anchor)
+                theta_free = np.arctan2(free_end[1] - anchor[1], free_end[0] - anchor[0])
+                theta_pivot = np.arctan2(pivot[1] - anchor[1], pivot[0] - anchor[0])
                 
-                # Draw pivot joint (yellow)
-                p1 = ax.scatter(*pivot, c='yellow', s=120, marker='o', 
-                               edgecolors='black', linewidths=2, zorder=11)
+                # 1. Full circle (GREEN)
+                arc_angles_full = np.linspace(0, 2*np.pi, 100)
+                arc_x_full = anchor[0] + arc_r_free * np.cos(arc_angles_full)
+                arc_y_full = anchor[1] + arc_r_free * np.sin(arc_angles_full)
+                arc_full_line.set_data(arc_x_full, arc_y_full)
                 
-                # ANCHORED end - RED SQUARE (FIXED to hold point!)
-                p2 = ax.scatter(*anchor, c='red', s=180, marker='s', 
-                               edgecolors='darkred', linewidths=3, zorder=12)
+                # 2. Highlighted arc segment (LIME)
+                arc_angles = np.linspace(theta_free - 0.8, theta_free + 0.8, 50)
+                arc_x = anchor[0] + arc_r_free * np.cos(arc_angles)
+                arc_y = anchor[1] + arc_r_free * np.sin(arc_angles)
+                arc_highlight_line.set_data(arc_x, arc_y)
                 
-                # FREE end - CYAN CIRCLE (can move)
-                p3 = ax.scatter(*free_end, c='cyan', s=140, marker='o', 
-                               edgecolors='blue', linewidths=2, zorder=11)
-                points.extend([p1, p2, p3])
+                # 3. Pivot arc (MAGENTA)
+                arc_angles_pivot = np.linspace(theta_pivot - 0.5, theta_pivot + 0.5, 40)
+                arc_x_pivot = anchor[0] + arc_r_pivot * np.cos(arc_angles_pivot)
+                arc_y_pivot = anchor[1] + arc_r_pivot * np.sin(arc_angles_pivot)
+                arc_pivot_line.set_data(arc_x_pivot, arc_y_pivot)
                 
-                # Title with action and anchor info
-                action = path[frame].action if path[frame].action else "START"
+                # ===== UPDATE ROBOT LINKS =====
+                link1_line.set_data([anchor[0], pivot[0]], [anchor[1], pivot[1]])
+                link2_line.set_data([pivot[0], free_end[0]], [pivot[1], free_end[1]])
+                
+                # ===== UPDATE JOINTS =====
+                pivot_point.set_offsets([pivot])
+                anchor_point.set_offsets([anchor])
+                free_point.set_offsets([free_end])
+                
+                # ===== DRAW MOTION ARROW =====
+                if prev_free_end[0] is not None:
+                    motion = free_end - prev_free_end[0]
+                    motion_mag = np.linalg.norm(motion)
+                    if motion_mag > 0.01:
+                        arr = ax.annotate('', xy=free_end, 
+                                         xytext=free_end - motion * 3,
+                                         arrowprops=dict(arrowstyle='->', color='orange', 
+                                                        lw=2.5, mutation_scale=18),
+                                         zorder=15)
+                        arrows.append(arr)
+                
+                prev_free_end[0] = free_end.copy()
+                
+                # ===== TITLE =====
                 anchor_label = f"Anchor: End {state.anchor_end}"
+                frame_info = f"[{frame_idx+1}/{total_frames}]"
                 
-                # Special highlight for anchor switches
-                if action == "switch":
-                    ax.set_title(f'Step {frame+1}/{len(path)} - ⚡ SWITCH ANCHOR ⚡ | {anchor_label}',
-                                fontsize=11, fontweight='bold', color='red')
+                if "SWITCH" in action_desc.upper():
+                    ax.set_title(f'{frame_info} Step {step_num+1}/{len(path)} - ** {action_desc} ** | {anchor_label}',
+                                fontsize=10, fontweight='bold', color='red')
+                elif "GOAL" in action_desc:
+                    ax.set_title(f'{frame_info} ** {action_desc} ** | {anchor_label}',
+                                fontsize=11, fontweight='bold', color='green')
                 else:
-                    ax.set_title(f'Step {frame+1}/{len(path)} - {action} | {anchor_label}', fontsize=10)
+                    ax.set_title(f'{frame_info} Step {step_num+1}/{len(path)} - {action_desc} | {anchor_label}', fontsize=9)
             
-            return lines + points
+            return [arc_full_line, arc_highlight_line, arc_pivot_line, link1_line, link2_line,
+                    pivot_point, anchor_point, free_point] + arrows
         
         from matplotlib.animation import FuncAnimation
-        anim = FuncAnimation(fig, animate, init_func=init, frames=len(path),
+        anim = FuncAnimation(fig, animate, init_func=init, frames=total_frames,
                             interval=interval, blit=False, repeat=True)
         
         if save_path:
@@ -722,9 +883,23 @@ def run_multi_goal_test():
     for i, (path, goal) in enumerate(zip(all_paths, goals)):
         if path:
             vis = Visualizer(robot, env)
-            fig, anim = vis.animate_path(path, goal, 
-                save_path=f'brachiation_2d_goal{i+1}.gif', interval=500)
-            plt.close(fig)
+            
+            if HEADLESS:
+                # In headless mode, just save the GIF
+                fig, anim = vis.animate_path(path, goal, 
+                    save_path=f'brachiation_2d_goal{i+1}.gif', interval=50)
+                plt.close(fig)
+            else:
+                # Show animation in window first, then save
+                print(f"\n  Showing animation for Goal {i+1} - close window to continue...")
+                fig, anim = vis.animate_path(path, goal, save_path=None, interval=50)
+                plt.show()
+                
+                # Now save
+                print(f"  Saving animation to brachiation_2d_goal{i+1}.gif...")
+                fig2, anim2 = vis.animate_path(path, goal, 
+                    save_path=f'brachiation_2d_goal{i+1}.gif', interval=50)
+                plt.close(fig2)
     
     # Visualization - static summary
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
