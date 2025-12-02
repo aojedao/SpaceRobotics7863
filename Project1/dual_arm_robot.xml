@@ -26,7 +26,7 @@
         <geom type="mesh" contype="0" conaffinity="0" group="2" material="gray"/>
       </default>
       <default class="collision">
-        <geom group="3"/>
+        <geom type="sphere" group="3" contype="1" conaffinity="1"/>
       </default>
       <site size="0.001" rgba="1 0 0 1" group="4"/>
     </default>
@@ -51,7 +51,7 @@
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
       </default>
       <default class="gripper_collision">
-        <geom type="mesh" group="3"/>
+        <geom type="mesh" group="3" contype="1" conaffinity="1"/>
         <default class="pad_box1">
           <geom mass="0" type="box" pos="0 -0.0026 0.028125" size="0.011 0.004 0.009375" friction="0.7"
             solimp="0.95 0.99 0.001" solref="0.004 1" priority="1" rgba="0.55 0.55 0.55 1"/>
@@ -65,7 +65,7 @@
     
     <!-- Central body defaults -->
     <default class="central_body">
-      <geom rgba="0.3 0.3 0.35 1"/>
+      <geom rgba="0.3 0.3 0.35 1" contype="1" conaffinity="1"/>
     </default>
   </default>
 
@@ -148,11 +148,11 @@
       <inertial mass="50" pos="0 0 0" diaginertia="2.0 1.0 1.5"/>
       <freejoint name="central_freejoint"/>
       
-      <!-- Central box geometry -->
-      <geom name="central_box" type="box" size="0.3 0.15 0.1" material="central_box" class="central_body" mass="30"/>
+      <!-- Central box geometry - COLLISION enabled -->
+      <geom name="central_box" type="box" size="0.3 0.15 0.1" material="central_box" class="central_body" mass="30" contype="1" conaffinity="1"/>
       
-      <!-- Visual details on central body -->
-      <geom name="top_plate" type="box" size="0.28 0.13 0.01" pos="0 0 0.11" rgba="0.35 0.35 0.4 1" mass="5"/>
+      <!-- Visual details on central body - COLLISION enabled -->
+      <geom name="top_plate" type="box" size="0.28 0.13 0.01" pos="0 0 0.11" rgba="0.35 0.35 0.4 1" mass="5" contype="1" conaffinity="1"/>
       
       <!-- ============================================== -->
       <!-- LEFT ARM (Arm 1) - Mounted on left side of box -->
@@ -331,6 +331,8 @@
 
                         </body>
                         <site name="left_gripper_center" pos="0 0 0.1" size="0.025" rgba="1 0 1 1"/>
+                        <!-- Collision sphere at gripper tip to prevent wall penetration -->
+                        <geom name="left_gripper_tip_collision" type="sphere" size="0.05" pos="0 0 0.1" contype="1" conaffinity="1" rgba="1 0 1 0.3"/>
                       </body>
                       
                     </body>
@@ -519,6 +521,8 @@
 
                         </body>
                         <site name="right_gripper_center" pos="0 0 0.1" size="0.025" rgba="0 1 1 1"/>
+                        <!-- Collision sphere at gripper tip to prevent wall penetration -->
+                        <geom name="right_gripper_tip_collision" type="sphere" size="0.05" pos="0 0 0.1" contype="1" conaffinity="1" rgba="0 1 1 0.3"/>
                       </body>
                       
                     </body>
