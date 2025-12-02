@@ -141,12 +141,13 @@ class WallPositionMapper:
     Maps discrete positions on the ISS module walls where the robot can grip.
     """
     
-    def __init__(self, step_size: float = 0.5, arm_reach: float = KUKA_REACH):
+    def __init__(self, step_size: float = 0.4, arm_reach: float = KUKA_REACH):
         self.step_size = step_size
         self.arm_reach = arm_reach
-        # Effective reach for path planning - accounts for body offset between arms
-        # The body is ~0.5m wide, so effective reach from one anchor to next is reduced
-        self.effective_reach = arm_reach * 0.8  # 1.0m effective reach
+        # Effective reach for path planning - REDUCED to prevent over-stretching
+        # This forces more waypoints and shorter individual reaches
+        # Shorter reaches = less arm crossing
+        self.effective_reach = arm_reach * 0.60  # 0.75m effective reach (was 1.0m)
         
         # Wall boundaries
         self.x_min = ISS_MODULE['x_min']
@@ -422,10 +423,9 @@ class WallCrawlerMuJoCoSimulation:
         self.data = mujoco.MjData(self.model)
         print("✓ Model loaded successfully!")
         
-        # Initialize wall position mapper with SMALLER step size for better reachability
-        # Use 0.5m step size - this ensures consecutive waypoints are within arm reach
-        # considering the body offset between arms (~0.5m) and arm reach (1.25m)
-        self.wall_mapper = WallPositionMapper(step_size=0.5, arm_reach=KUKA_REACH)
+        # Initialize wall position mapper with SMALLER step size to reduce arm crossing
+        # Smaller steps = more waypoints = less stretching = less crossing
+        self.wall_mapper = WallPositionMapper(step_size=0.35, arm_reach=KUKA_REACH)
         
         # Initialize path planner
         self.path_planner = PathPlanner(self.wall_mapper)
@@ -506,8 +506,8 @@ class WallCrawlerMuJoCoSimulation:
         self.right_arm_qvel_slice = slice(21, 28)
         
         # Controller gains - Aggressive for faster convergence
-        self.kp_position = 500.0      # Position control (high for fast tracking)
-        self.kd_position = 20.0       # Damping (low for fast response)
+        self.kp_position = 800.0      # Position control (very high for fast tracking)
+        self.kd_position = 8.0        # Damping (lower for faster response)
         self.kp_orientation = 40.0    # Orientation control
         self.kd_orientation = 20.0
         self.lambda_dls = 0.01        # Damping for DLS (very low for aggressive tracking)
@@ -631,6 +631,60 @@ class WallCrawlerMuJoCoSimulation:
         """Get right end-effector orientation as 3x3 rotation matrix"""
         return self.data.site_xmat[self.right_gripper_site_id].reshape(3, 3).copy()
     
+    def get_surface_normal(self, wall: str) -> np.ndarray:
+        """Get the inward-pointing surface normal for a wall.
+        
+        The gripper should approach perpendicular to the surface,
+        so the gripper Z-axis should align with the INWARD normal.
+        
+        Args:
+            wall: 'floor', 'ceiling', 'front', 'back', 'left_wall', 'right_wall'
+            
+        Returns:
+            3D unit vector pointing INTO the module from the wall
+        """
+        normals = {
+            'floor': np.array([0.0, 0.0, 1.0]),       # Up (into module from floor)
+            'ceiling': np.array([0.0, 0.0, -1.0]),    # Down (into module from ceiling)
+            'front': np.array([0.0, -1.0, 0.0]),      # -Y (into module from front +Y wall)
+            'back': np.array([0.0, 1.0, 0.0]),        # +Y (into module from back -Y wall)
+            'left_wall': np.array([1.0, 0.0, 0.0]),   # +X (into module from left -X wall)
+            'right_wall': np.array([-1.0, 0.0, 0.0]), # -X (into module from right +X wall)
+        }
+        return normals.get(wall, np.array([0.0, 0.0, -1.0]))  # Default: down
+    
+    def get_target_orientation_matrix(self, wall: str) -> np.ndarray:
+        """Get desired end-effector orientation matrix for approaching a wall.
+        
+        The gripper should approach perpendicular to surface:
+        - Gripper Z-axis aligned with surface normal (pointing INTO surface)
+        - Gripper X and Y axes form a valid rotation
+        
+        Args:
+            wall: Wall type string
+            
+        Returns:
+            3x3 rotation matrix for desired gripper orientation
+        """
+        # Surface normal is direction gripper should point (its Z-axis)
+        z_axis = -self.get_surface_normal(wall)  # Gripper points INTO surface
+        
+        # Choose an arbitrary up vector (avoid parallel with z_axis)
+        if abs(z_axis[2]) < 0.9:
+            up = np.array([0.0, 0.0, 1.0])
+        else:
+            up = np.array([0.0, 1.0, 0.0])
+        
+        # Compute orthonormal basis
+        x_axis = np.cross(up, z_axis)
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis = y_axis / np.linalg.norm(y_axis)
+        
+        # Build rotation matrix [x, y, z] as columns
+        R = np.column_stack([x_axis, y_axis, z_axis])
+        return R
+    
     def compute_jacobian(self, body_id: int) -> Tuple[np.ndarray, np.ndarray]:
         """Compute the Jacobian for a given body"""
         jacp = np.zeros((3, self.model.nv))
@@ -706,6 +760,183 @@ class WallCrawlerMuJoCoSimulation:
             self.right_arm_anchored = False
             self.right_anchor_position = None
     
+    def detect_arm_crossing(self, verbose: bool = False) -> Tuple[bool, float]:
+        """Detect if the arms are crossing each other.
+        
+        Arms are considered crossing when:
+        1. Left gripper is on the right side of body center (positive local X)
+        2. Right gripper is on the left side of body center (negative local X)
+        3. Or the grippers are very close to each other
+        
+        Args:
+            verbose: If True, print detailed diagnostic information
+        
+        Returns:
+            Tuple of (is_crossing, crossing_severity)
+            - is_crossing: True if arms are crossing
+            - crossing_severity: 0.0 to 1.0, how badly they're crossing
+        """
+        body_pos = self.get_central_body_pos()
+        body_quat = self.data.qpos[3:7]
+        
+        left_grip = self.get_left_gripper_pos()
+        right_grip = self.get_right_gripper_pos()
+        
+        # Get body yaw for local frame calculation
+        w, x, y, z = body_quat
+        body_yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        
+        # Compute gripper positions in body-local frame
+        # Rotate world positions into body frame
+        cos_yaw = np.cos(-body_yaw)
+        sin_yaw = np.sin(-body_yaw)
+        
+        left_rel = left_grip - body_pos
+        right_rel = right_grip - body_pos
+        
+        # Local X coordinates (positive = right side of body, negative = left side)
+        left_local_x = left_rel[0] * cos_yaw - left_rel[1] * sin_yaw
+        right_local_x = right_rel[0] * cos_yaw - right_rel[1] * sin_yaw
+        
+        # Local Y coordinates for diagnostics
+        left_local_y = left_rel[0] * sin_yaw + left_rel[1] * cos_yaw
+        right_local_y = right_rel[0] * sin_yaw + right_rel[1] * cos_yaw
+        
+        # Check for crossing:
+        # Left arm should have negative local X (left side)
+        # Right arm should have positive local X (right side)
+        # Use larger thresholds - only flag when arms REALLY cross
+        left_on_wrong_side = left_local_x > 0.2   # Left gripper significantly on right side
+        right_on_wrong_side = right_local_x < -0.2  # Right gripper significantly on left side
+        
+        # Also check if grippers are dangerously close (collision risk)
+        gripper_distance = np.linalg.norm(left_grip - right_grip)
+        grippers_too_close = gripper_distance < 0.15  # Only flag if very close (15cm)
+        
+        # Both conditions must be true for real crossing (not just proximity)
+        is_crossing = (left_on_wrong_side and right_on_wrong_side) or grippers_too_close
+        
+        # Calculate severity - how much are they crossing?
+        severity = 0.0
+        if left_on_wrong_side and right_on_wrong_side:
+            # Both arms on wrong side - real crossing
+            severity += min((left_local_x - 0.1) / 0.4, 0.5)
+            severity += min((-right_local_x - 0.1) / 0.4, 0.5)
+        if grippers_too_close:
+            severity += (0.15 - gripper_distance) / 0.15  # Closer = worse
+        
+        severity = min(severity, 1.0)
+        
+        # DIAGNOSTIC OUTPUT when crossing detected
+        if is_crossing and verbose:
+            diag_counter = getattr(self, '_crossing_diag_counter', 0) + 1
+            self._crossing_diag_counter = diag_counter
+            if diag_counter % 200 == 1:  # Print every ~0.4 seconds when crossing
+                print(f"\n  ╔══════════════════════════════════════════════════════════╗")
+                print(f"  ║           ⚠️  ARM CROSSING DIAGNOSTICS                    ║")
+                print(f"  ╠══════════════════════════════════════════════════════════╣")
+                print(f"  ║ Body Position: ({body_pos[0]:.3f}, {body_pos[1]:.3f}, {body_pos[2]:.3f})")
+                print(f"  ║ Body Yaw: {np.degrees(body_yaw):.1f}°")
+                print(f"  ╟──────────────────────────────────────────────────────────╢")
+                print(f"  ║ LEFT Gripper (world):  ({left_grip[0]:.3f}, {left_grip[1]:.3f}, {left_grip[2]:.3f})")
+                print(f"  ║ LEFT Gripper (local):  X={left_local_x:+.3f}, Y={left_local_y:+.3f}")
+                print(f"  ║   → Should be X < -0.2 | {'❌ ON WRONG SIDE' if left_on_wrong_side else '✓ OK'}")
+                print(f"  ╟──────────────────────────────────────────────────────────╢")
+                print(f"  ║ RIGHT Gripper (world): ({right_grip[0]:.3f}, {right_grip[1]:.3f}, {right_grip[2]:.3f})")
+                print(f"  ║ RIGHT Gripper (local): X={right_local_x:+.3f}, Y={right_local_y:+.3f}")
+                print(f"  ║   → Should be X > +0.2 | {'❌ ON WRONG SIDE' if right_on_wrong_side else '✓ OK'}")
+                print(f"  ╟──────────────────────────────────────────────────────────╢")
+                print(f"  ║ Gripper Distance: {gripper_distance:.3f}m {'⚠️ TOO CLOSE' if grippers_too_close else ''}")
+                print(f"  ║ Crossing Severity: {severity:.2f} / 1.00")
+                reason = []
+                if left_on_wrong_side and right_on_wrong_side:
+                    reason.append("BOTH ARMS ON WRONG SIDES")
+                if grippers_too_close:
+                    reason.append("GRIPPERS TOO CLOSE")
+                print(f"  ║ Reason: {' + '.join(reason)}")
+                print(f"  ╚══════════════════════════════════════════════════════════╝\n")
+        elif not is_crossing:
+            # Reset counter when not crossing
+            self._crossing_diag_counter = 0
+        
+        return is_crossing, severity
+    
+    def compute_first_joint_target(self, arm: str, target_pos: np.ndarray, 
+                                    relaxed_limits: bool = False) -> float:
+        """Compute the ideal first joint angle to orient the arm toward target.
+        
+        The first joint (shoulder rotation) determines the direction the arm points.
+        We want the arm to point toward the target without crossing the other arm.
+        
+        Left arm: base at body_x - 0.25, points best in range [-π, 0] (left side)
+        Right arm: base at body_x + 0.25, points best in range [0, π] (right side)
+        
+        Args:
+            arm: 'left' or 'right'
+            target_pos: Target position in world coordinates
+            relaxed_limits: If True, allow wider range for coordinated control
+            
+        Returns:
+            Ideal first joint angle in radians
+        """
+        body_pos = self.get_central_body_pos()
+        body_quat = self.data.qpos[3:7]
+        
+        # Get arm base position (offset from body)
+        if arm == 'left':
+            arm_base_offset = np.array([-0.25, 0, 0])  # Left arm is -X from body
+        else:
+            arm_base_offset = np.array([0.25, 0, 0])   # Right arm is +X from body
+        
+        # Arm base in world coordinates (simplified - assume body aligned with world)
+        arm_base = body_pos + arm_base_offset
+        
+        # Vector from arm base to target (in XY plane)
+        to_target = target_pos - arm_base
+        to_target_xy = np.array([to_target[0], to_target[1]])
+        
+        if np.linalg.norm(to_target_xy) < 0.1:
+            return 0.0  # Target is directly above/below
+        
+        # Angle in world XY plane
+        world_angle = np.arctan2(to_target_xy[1], to_target_xy[0])
+        
+        # Get body yaw to compute relative angle
+        w, x, y, z = body_quat
+        body_yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        
+        # First joint angle relative to body
+        # The arm's first joint rotates around body's local Z axis
+        joint1_angle = world_angle - body_yaw
+        
+        # Normalize to [-π, π]
+        while joint1_angle > np.pi:
+            joint1_angle -= 2*np.pi
+        while joint1_angle < -np.pi:
+            joint1_angle += 2*np.pi
+        
+        # Set limits based on mode - STRICT to prevent crossing
+        if relaxed_limits:
+            max_limit = np.pi * 0.6   # Allow up to 108 degrees
+        else:
+            max_limit = np.pi * 0.4   # Only 72 degrees - keep arms on their sides
+        
+        # STRICT constraints: Keep arms on their designated sides
+        # Left arm: should be in range [-π, +max_limit] (mostly left side)
+        # Right arm: should be in range [-max_limit, +π] (mostly right side)
+        if arm == 'left':
+            # Left arm: limit how far it can go to the RIGHT (positive angles)
+            if joint1_angle > max_limit:
+                joint1_angle = max_limit
+            # Allow left arm to go far left (negative angles) freely
+        else:
+            # Right arm: limit how far it can go to the LEFT (negative angles)
+            if joint1_angle < -max_limit:
+                joint1_angle = -max_limit
+            # Allow right arm to go far right (positive angles) freely
+        
+        return joint1_angle
+    
     def compute_arm_control(self, arm: str = 'left') -> Tuple[np.ndarray, np.ndarray]:
         """Compute Cartesian space control for specified arm
         
@@ -765,17 +996,96 @@ class WallCrawlerMuJoCoSimulation:
         current_joint_pos = self.data.qpos[qpos_slice]
         joint_pos_cmd = current_joint_pos + joint_vel_cmd * self.model.opt.timestep
         
+        # ======================================================================
+        # FIRST JOINT PRIORITIZATION - Keep arms on their designated sides
+        # Left arm: should stay in negative angles (left side of body)
+        # Right arm: should stay in positive angles (right side of body)
+        # ======================================================================
+        
+        # Check if THIS arm is anchored - if so, don't modify first joint
+        arm_is_anchored = (arm == 'left' and self.left_arm_anchored) or \
+                          (arm == 'right' and self.right_arm_anchored)
+        
+        # Check for arm crossing (with verbose diagnostics)
+        is_crossing, crossing_severity = self.detect_arm_crossing(verbose=True)
+        
+        ideal_j1 = self.compute_first_joint_target(arm, target_pos)
+        current_j1 = current_joint_pos[0]
+        j1_error = ideal_j1 - current_j1
+        
+        # Wrap to [-π, π]
+        while j1_error > np.pi:
+            j1_error -= 2*np.pi
+        while j1_error < -np.pi:
+            j1_error += 2*np.pi
+        
+        # ANTI-CROSSING: Keep arms on their designated sides
+        # Left arm: prefer negative angles (left side), limit positive range
+        # Right arm: prefer positive angles (right side), limit negative range
+        if not arm_is_anchored:
+            if arm == 'left':
+                # Left arm should stay on left side (negative angles)
+                # If current angle is positive and trying to go more positive, resist
+                if current_j1 > 0.3 and j1_error > 0:
+                    # Actively push back to left side
+                    j1_error = -0.5 - current_j1  # Push toward -0.5 rad
+                    j1_correction_gain = 20.0
+                    if is_crossing:
+                        cross_counter = getattr(self, '_cross_print_counter', 0) + 1
+                        self._cross_print_counter = cross_counter
+                        if cross_counter % 100 == 1:
+                            print(f"  ⚠️ LEFT arm on wrong side! Pushing back to left")
+                else:
+                    pos_error_mag = np.linalg.norm(pos_error)
+                    j1_correction_gain = 12.0 if pos_error_mag > 0.3 else 4.0
+            else:  # right arm
+                # Right arm should stay on right side (positive angles)
+                # If current angle is negative and trying to go more negative, resist
+                if current_j1 < -0.3 and j1_error < 0:
+                    # Actively push back to right side
+                    j1_error = 0.5 - current_j1  # Push toward +0.5 rad
+                    j1_correction_gain = 20.0
+                    if is_crossing:
+                        cross_counter = getattr(self, '_cross_print_counter', 0) + 1
+                        self._cross_print_counter = cross_counter
+                        if cross_counter % 100 == 1:
+                            print(f"  ⚠️ RIGHT arm on wrong side! Pushing back to right")
+                else:
+                    pos_error_mag = np.linalg.norm(pos_error)
+                    j1_correction_gain = 12.0 if pos_error_mag > 0.3 else 4.0
+        else:
+            # Anchored arm - gentle correction only
+            pos_error_mag = np.linalg.norm(pos_error)
+            j1_correction_gain = 4.0
+        
+        dt = self.model.opt.timestep
+        delta_j1 = j1_correction_gain * j1_error * dt
+        # Clamp per-step change
+        max_delta = 0.10
+        if delta_j1 > max_delta:
+            delta_j1 = max_delta
+        elif delta_j1 < -max_delta:
+            delta_j1 = -max_delta
+        joint_pos_cmd[0] += delta_j1
+        
         return joint_pos_cmd, pos_error
     
-    def apply_arm_control(self, arm: str = 'left', skip_base_joints: int = 0):
+    def apply_arm_control(self, arm: str = 'left', skip_base_joints: int = 0, anchored_mode: bool = False):
         """Apply arm control to reach target position
         
         Args:
             arm: 'left' or 'right'
             skip_base_joints: Number of base joints to skip (0=full control, 3=skip first 3 joints)
                              This allows partial release for body swinging during locomotion.
+            anchored_mode: If True, only control last 2 joints (wrist) to maintain anchor,
+                          allowing first 5 joints to be adjusted by coordinated control
         """
         joint_cmd, pos_error = self.compute_arm_control(arm)
+        
+        if anchored_mode:
+            # In anchored mode, only control last 2 joints (wrist) with higher gains
+            # First 5 joints are left for coordinated control
+            skip_base_joints = 5
         
         if arm == 'left':
             if skip_base_joints > 0:
@@ -792,6 +1102,190 @@ class WallCrawlerMuJoCoSimulation:
         
         return np.linalg.norm(pos_error)
     
+    def apply_coordinated_arm_control(self, anchored_arm: str, moving_target: np.ndarray, anchor_pos: np.ndarray):
+        """Use first 5 joints of anchored arm to help body reach moving arm's target.
+        
+        When the EE is anchored, rotating the base joints moves the body.
+        We use inverse kinematics where the "target" is calculated to move the body
+        toward a better position for the moving arm to reach its target.
+        
+        Key insight: If we want to move body by delta_body, and EE is fixed,
+        we can think of it as moving the EE by -delta_body in the body frame,
+        then solving IK for that.
+        
+        Args:
+            anchored_arm: 'left' or 'right' - the arm that is anchored
+            moving_target: The target position the moving arm is trying to reach
+            anchor_pos: The anchor position that must be maintained
+        """
+        # Get current positions
+        body_pos = self.get_central_body_pos()
+        body_to_target = moving_target - body_pos
+        target_distance = np.linalg.norm(body_to_target)
+        
+        # Don't bother if body is already very close to target
+        if target_distance < 0.2:
+            return
+        
+        # Get arm-specific data
+        if anchored_arm == 'left':
+            body_id = self.left_ee_body_id
+            qpos_slice = self.left_arm_qpos_slice
+            qvel_slice = self.left_arm_qvel_slice
+            actuator_slice = self.left_arm_actuator_slice
+        else:
+            body_id = self.right_ee_body_id
+            qpos_slice = self.right_arm_qpos_slice
+            qvel_slice = self.right_arm_qvel_slice
+            actuator_slice = self.right_arm_actuator_slice
+        
+        # Desired body motion direction (toward moving target)
+        body_direction = body_to_target / target_distance
+        
+        # Scale velocity by distance - more aggressive when far
+        desired_body_vel = body_direction * min(target_distance, 0.8)
+        
+        # Get the Jacobian for the anchored arm's end-effector
+        jacp_full, _ = self.compute_jacobian(body_id)
+        
+        # Extract arm-specific Jacobian for first 5 joints only
+        if anchored_arm == 'left':
+            J_base = jacp_full[:, 6:11]   # Left arm joints 0-4 (columns 6-10 in full Jacobian)
+        else:
+            J_base = jacp_full[:, 21:26]  # Right arm joints 0-4 (columns 21-25 in full Jacobian)
+        
+        # Very high gains for fast body repositioning
+        kp_coord = 2500.0   # Higher proportional gain for faster response
+        kd_coord = 1.5      # Low damping for fast response
+        
+        # When EE is fixed, body moves opposite to what joint motion would cause EE to move
+        # So to move body by +delta, we want joint motion that would move EE by -delta
+        task_vel = -kp_coord * desired_body_vel
+        
+        # Damped least squares inverse
+        lambda_coord = 0.08
+        JJT = J_base @ J_base.T  # 3x3
+        J_pinv = J_base.T @ np.linalg.inv(JJT + lambda_coord**2 * np.eye(3))  # 5x3
+        
+        # Joint velocities
+        joint_vel_base = J_pinv @ task_vel
+        
+        # Apply damping
+        current_joint_vel = self.data.qvel[qvel_slice][:5]
+        joint_vel_base -= kd_coord * current_joint_vel
+        
+        # Convert to position command for first 5 joints
+        current_q = self.data.qpos[qpos_slice]
+        dt = self.model.opt.timestep
+        
+        for i in range(5):
+            new_q = current_q[i] + joint_vel_base[i] * dt
+            self.data.ctrl[actuator_slice.start + i] = new_q
+    
+    def apply_arm_control_with_orientation(self, arm: str, target_wall: str, skip_base_joints: int = 0):
+        """Apply arm control with orientation alignment to approach wall perpendicularly.
+        
+        Args:
+            arm: 'left' or 'right'
+            target_wall: Wall type for orientation alignment
+            skip_base_joints: Number of base joints to skip
+            
+        Returns:
+            Position error magnitude
+        """
+        if arm == 'left':
+            current_pos = self.get_left_gripper_pos()
+            current_orient = self.get_left_ee_orientation()
+            target_pos = self.left_target_position
+            body_id = self.left_ee_body_id
+            qpos_slice = self.left_arm_qpos_slice
+            qvel_slice = self.left_arm_qvel_slice
+            actuator_slice = self.left_arm_actuator_slice
+        else:
+            current_pos = self.get_right_gripper_pos()
+            current_orient = self.get_right_ee_orientation()
+            target_pos = self.right_target_position
+            body_id = self.right_ee_body_id
+            qpos_slice = self.right_arm_qpos_slice
+            qvel_slice = self.right_arm_qvel_slice
+            actuator_slice = self.right_arm_actuator_slice
+        
+        if target_pos is None:
+            return 0.0
+        
+        # Position error
+        pos_error = target_pos - current_pos
+        
+        # Orientation error - align gripper Z-axis with surface approach direction
+        target_orient = self.get_target_orientation_matrix(target_wall)
+        orient_error_matrix = target_orient @ current_orient.T
+        
+        # Extract axis-angle from rotation matrix for orientation error
+        trace = np.trace(orient_error_matrix)
+        angle = np.arccos(np.clip((trace - 1) / 2, -1, 1))
+        
+        if angle > 1e-6:
+            # Extract rotation axis
+            axis = np.array([
+                orient_error_matrix[2, 1] - orient_error_matrix[1, 2],
+                orient_error_matrix[0, 2] - orient_error_matrix[2, 0],
+                orient_error_matrix[1, 0] - orient_error_matrix[0, 1]
+            ])
+            axis = axis / (2 * np.sin(angle) + 1e-10)
+            orient_error = angle * axis
+        else:
+            orient_error = np.zeros(3)
+        
+        # Get full Jacobian (position + orientation)
+        jacp, jacr = self.compute_jacobian(body_id)
+        
+        # Extract arm-specific Jacobians
+        if arm == 'left':
+            arm_jacp = jacp[:, 6:13]
+            arm_jacr = jacr[:, 6:13]
+        else:
+            arm_jacp = jacp[:, 21:28]
+            arm_jacr = jacr[:, 21:28]
+        
+        # Stack position and orientation Jacobians (6x7)
+        J = np.vstack([arm_jacp, arm_jacr])
+        
+        # Task error: position + scaled orientation
+        task_error = np.concatenate([
+            self.kp_position * pos_error,
+            self.kp_orientation * orient_error
+        ])
+        
+        # Current joint velocities
+        current_joint_vel = self.data.qvel[qvel_slice]
+        
+        # Damped least squares for 6x7 Jacobian
+        JJT = J @ J.T  # 6x6
+        J_pinv = J.T @ np.linalg.inv(JJT + self.lambda_dls**2 * np.eye(6))  # 7x6
+        
+        # Compute joint velocity command
+        joint_vel_cmd = J_pinv @ task_error
+        
+        # Add velocity damping
+        joint_vel_cmd -= self.kd_position * current_joint_vel
+        
+        # Convert to position command
+        current_joint_pos = self.data.qpos[qpos_slice]
+        joint_pos_cmd = current_joint_pos + joint_vel_cmd * self.model.opt.timestep
+        
+        # Apply skip_base_joints if needed
+        if skip_base_joints > 0:
+            if arm == 'left':
+                current_base = self.data.qpos[7:7+skip_base_joints]
+            else:
+                current_base = self.data.qpos[22:22+skip_base_joints]
+            joint_pos_cmd[:skip_base_joints] = current_base
+        
+        # Apply control
+        self.data.ctrl[actuator_slice] = joint_pos_cmd
+        
+        return np.linalg.norm(pos_error)
+
     def anchor_gripper(self, arm: str, position: np.ndarray):
         """Anchor the gripper at a specific world position by constraining velocities
         
@@ -814,10 +1308,16 @@ class WallCrawlerMuJoCoSimulation:
         if arm == 'left':
             self.left_arm_anchored = False
             self.left_anchor_position = None
+            # Clear locked joints so they can be re-captured on next anchor
+            if hasattr(self, '_locked_left_joints'):
+                self._locked_left_joints = None
             print(f"  🔓 LEFT arm RELEASED")
         else:
             self.right_arm_anchored = False
             self.right_anchor_position = None
+            # Clear locked joints
+            if hasattr(self, '_locked_right_joints'):
+                self._locked_right_joints = None
             print(f"  🔓 RIGHT arm RELEASED")
     
     def maintain_anchor(self, arm: str, control_anchored_arm: bool = False):
@@ -1166,7 +1666,7 @@ class WallCrawlerMuJoCoSimulation:
                 # Place body so left arm only needs to reach ~0.3m to anchor
                 body_x = wp1[0] + 0.25         # Body X so arm base is at anchor X
                 body_y = wp1[1] - 0.5          # Only 50cm behind anchor (very close)
-                body_z = 1.0                   # LOWER starting height (middle of workspace)
+                body_z = 1.0                   # Middle height (works for both ceiling and floor paths)
                 
                 # STRICT clamping to ensure ENTIRE robot is inside module
                 # Robot extends ~0.3m in each direction from body center
@@ -1247,31 +1747,44 @@ class WallCrawlerMuJoCoSimulation:
             step_count = 0
             first_render = True
             
-            # SIMPLIFIED: Focus ONLY on left arm reaching anchor
-            settling_timeout = 3000    # More time to reach anchor
+            # ================================================================
+            # FULL TRAJECTORY LOCOMOTION STATE MACHINE
+            # ================================================================
+            settling_timeout = 3000    # Max steps per waypoint
             crawl_phase = 'reaching_anchor'
             phase_timer = 0
             best_error = float('inf')
-            right_arm_timer = 0
-            right_arm_best_error = float('inf')
             
-            # Get waypoints for the locomotion sequence
-            right_target = None
-            left_next_target = None  # Third waypoint for left arm after both anchored
+            # Trajectory tracking
+            current_waypoint_idx = 0  # Start at first waypoint
+            total_waypoints = len(self.current_path) if self.current_path else 0
             
-            if self.current_path and len(self.current_path) > 1:
-                # Second waypoint is for RIGHT arm
-                wp2 = np.array(self.current_path[1].position)
-                right_target = wp2.copy()
-                print(f"  Second anchor (WP2 - RIGHT arm): ({wp2[0]:.2f}, {wp2[1]:.2f}, {wp2[2]:.2f})")
+            # Get all waypoints and walls from path
+            waypoints = []
+            waypoint_walls = []
+            waypoint_arms = []
+            
+            if self.current_path:
+                for wp in self.current_path:
+                    waypoints.append(np.array(wp.position))
+                    waypoint_walls.append(wp.wall)
+                    waypoint_arms.append(wp.active_arm)
                 
-                if len(self.current_path) > 2:
-                    # Third waypoint is for LEFT arm (after releasing)
-                    wp3 = np.array(self.current_path[2].position)
-                    left_next_target = wp3.copy()
-                    print(f"  Third anchor (WP3 - LEFT arm next): ({wp3[0]:.2f}, {wp3[1]:.2f}, {wp3[2]:.2f})")
+                print(f"\n📍 FULL TRAJECTORY: {total_waypoints} waypoints")
+                for i, (wp, wall, arm) in enumerate(zip(waypoints, waypoint_walls, waypoint_arms)):
+                    is_final = " [FINAL GOAL]" if i == total_waypoints - 1 else ""
+                    print(f"  WP{i+1}: ({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}) | {wall:12s} | {arm.upper()} arm{is_final}")
             
-            # Store initial body position to keep it fixed DURING left arm approach
+            # Current moving arm and anchored arm
+            moving_arm = 'left'  # Start with left arm moving to WP1
+            anchored_arm = 'right'
+            
+            # Current target (first waypoint)
+            current_target = waypoints[0] if waypoints else None
+            current_target_wall = waypoint_walls[0] if waypoint_walls else 'front'
+            use_orientation_control = False  # Only for final approach
+            
+            # Store initial body position
             initial_body_pos = self.data.qpos[0:3].copy()
             initial_body_quat = self.data.qpos[3:7].copy()
             
@@ -1285,27 +1798,33 @@ class WallCrawlerMuJoCoSimulation:
             body_pos = self.get_central_body_pos()
             left_pos = self.get_left_gripper_pos()
             right_pos = self.get_right_gripper_pos()
-            anchor = self.left_anchor_position
             
             print(f"  Body at ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
             print(f"  Left gripper at ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f})")
             print(f"  Right gripper at ({right_pos[0]:.2f}, {right_pos[1]:.2f}, {right_pos[2]:.2f})")
-            if anchor is not None:
-                initial_error = np.linalg.norm(anchor - left_pos)
-                print(f"  Left target anchor: ({anchor[0]:.2f}, {anchor[1]:.2f}, {anchor[2]:.2f})")
-                print(f"  Initial distance to anchor: {initial_error:.3f}m")
+            if current_target is not None:
+                initial_error = np.linalg.norm(current_target - left_pos)
+                print(f"  First target: ({current_target[0]:.2f}, {current_target[1]:.2f}, {current_target[2]:.2f})")
+                print(f"  Initial distance: {initial_error:.3f}m")
             
             print(f"\n{'='*60}")
-            print("LOCOMOTION SEQUENCE:")
-            print("  1. Left arm reaches and anchors at WP1")
-            print("  2. Right arm reaches and anchors at WP2")
-            print("  3. Left arm RELEASES and reaches WP3")
-            print("  4. Continue alternating...")
+            print("LOCOMOTION PHASES:")
+            print("  1. Reach waypoints alternating left/right arms")
+            print("  2. Anchor arm at each waypoint")
+            print("  3. Release previous anchor, reach next")
+            print("  4. Final waypoint: approach perpendicular to surface")
             print(f"{'='*60}")
             
             # Store the left arm joint positions when anchored
             left_arm_anchored_joints = None
             right_arm_anchored_joints = None
+            
+            # ================================================================
+            # TRACKING: Success rate and anchor deviation
+            # ================================================================
+            trajectory_success = False
+            anchor_deviation_history = {}  # {waypoint_idx: {'anchor_pos': ..., 'max_deviation': ..., 'deviations': [...]}}
+            current_anchor_idx = None
             
             while viewer.is_running():
                 step_start = time.time()
@@ -1316,291 +1835,459 @@ class WallCrawlerMuJoCoSimulation:
                 body_damping = 5.0
                 self.data.qvel[0:6] *= (1.0 - body_damping * self.model.opt.timestep)
                 
+                # Clear body force/torque at start of each step
+                self.data.xfrc_applied[self.central_body_id, :] = 0
+                
                 # ============================================================
-                # SIMPLIFIED STATE MACHINE: Just reach anchor with left arm
+                # BODY ORIENTATION CONTROL - Keep body aimed at ISS center
+                # ============================================================
+                # ISS module center (approximately)
+                iss_center = np.array([0.9, 0.6, 1.15])
+                body_pos = self.get_central_body_pos()
+                
+                # Get current body orientation (quaternion)
+                body_quat = self.data.qpos[3:7].copy()
+                
+                # Desired orientation: body Y-axis (front) points toward ISS center
+                to_center = iss_center - body_pos
+                to_center_horiz = np.array([to_center[0], to_center[1], 0.0])
+                horiz_dist = np.linalg.norm(to_center_horiz)
+                
+                if horiz_dist > 0.1:
+                    # Compute desired yaw angle (rotation around Z)
+                    desired_yaw = np.arctan2(to_center_horiz[1], to_center_horiz[0])
+                    
+                    # Current yaw from quaternion
+                    # Extract yaw from quaternion (rotation around Z)
+                    w, x, y, z = body_quat
+                    current_yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+                    
+                    # Yaw error
+                    yaw_error = desired_yaw - current_yaw
+                    # Wrap to [-pi, pi]
+                    while yaw_error > np.pi:
+                        yaw_error -= 2*np.pi
+                    while yaw_error < -np.pi:
+                        yaw_error += 2*np.pi
+                    
+                    # Apply torque to correct orientation (keep box aimed at ISS center)
+                    # Increase stiffness slightly for a firmer heading while keeping damping to avoid oscillation
+                    orientation_stiffness = 80.0
+                    orientation_damping = 18.0
+                    yaw_vel = self.data.qvel[5]  # Angular velocity around Z
+                    
+                    torque_z = orientation_stiffness * yaw_error - orientation_damping * yaw_vel
+                    # write into moment (z) slot for central body
+                    self.data.xfrc_applied[self.central_body_id, 5] = torque_z
+                
+                # ============================================================
+                # FULL TRAJECTORY STATE MACHINE
                 # ============================================================
                 
+                # Helper function to apply anchor force AND body pull force
+                # IMPROVED: Better damping to reduce vibration
+                def apply_anchor_force(arm, anchor_pos, prev_pos_attr, hard_lock: bool = False):
+                    """Apply anchor force to hold end-effector at position.
+                    
+                    Args:
+                        arm: 'left' or 'right'
+                        anchor_pos: Target anchor position
+                        prev_pos_attr: Attribute name to store previous position
+                        hard_lock: If True, use very aggressive locking (for final position)
+                    """
+                    if arm == 'left':
+                        pos = self.get_left_gripper_pos()
+                        ee_body_id = self.left_ee_body_id
+                        qpos_slice = slice(7, 14)
+                        qvel_slice = slice(6, 13)
+                        ctrl_slice = self.left_arm_actuator_slice
+                    else:
+                        pos = self.get_right_gripper_pos()
+                        ee_body_id = self.right_ee_body_id
+                        qpos_slice = slice(22, 29)
+                        qvel_slice = slice(21, 28)
+                        ctrl_slice = self.right_arm_actuator_slice
+                    
+                    err = anchor_pos - pos
+                    err_mag = np.linalg.norm(err)
+                    
+                    # Track previous position for velocity estimation
+                    prev_pos = getattr(self, prev_pos_attr, pos)
+                    vel_approx = (pos - prev_pos) / self.model.opt.timestep
+                    setattr(self, prev_pos_attr, pos.copy())
+                    
+                    # CRITICAL DAMPING: zeta = 1.0 for no overshoot
+                    # For critically damped system: damping = 2 * sqrt(stiffness * mass)
+                    # Assume effective mass ~5 kg at end-effector
+                    effective_mass = 5.0
+                    
+                    if hard_lock:
+                        # HARD LOCK MODE: Very high stiffness, critical damping
+                        grip_stiffness = 80000.0
+                        grip_damping = 2.0 * np.sqrt(grip_stiffness * effective_mass)  # ~1265
+                        max_force = 50000.0
+                        velocity_damping_factor = 0.5  # Aggressive velocity kill
+                    else:
+                        # Normal anchoring
+                        grip_stiffness = 50000.0
+                        grip_damping = 2.0 * np.sqrt(grip_stiffness * effective_mass)  # ~1000
+                        max_force = 20000.0
+                        velocity_damping_factor = 0.9  # Gentle damping
+                    
+                    # Spring-damper force with critical damping
+                    force = grip_stiffness * err - grip_damping * vel_approx
+                    force_mag = np.linalg.norm(force)
+                    if force_mag > max_force:
+                        force = force * (max_force / force_mag)
+                    self.data.xfrc_applied[ee_body_id, 0:3] = force
+                    
+                    # Lock arm joints to maintain anchor rigidly
+                    lock_attr = f'_locked_{arm}_joints'
+                    if not hasattr(self, lock_attr) or getattr(self, lock_attr) is None:
+                        # First time - save current joint positions
+                        setattr(self, lock_attr, self.data.qpos[qpos_slice].copy())
+                    
+                    # Apply joint position control to lock the arm
+                    locked_joints = getattr(self, lock_attr)
+                    if locked_joints is not None:
+                        self.data.ctrl[ctrl_slice] = locked_joints
+                        # Damp joint velocities to prevent vibration
+                        self.data.qvel[qvel_slice] *= velocity_damping_factor
+                        
+                        if hard_lock:
+                            # In hard lock mode, also force-restore joint positions
+                            # This directly overrides any physics drift
+                            joint_error = locked_joints - self.data.qpos[qpos_slice]
+                            if np.linalg.norm(joint_error) > 0.001:
+                                # Blend toward locked position
+                                self.data.qpos[qpos_slice] = self.data.qpos[qpos_slice] + 0.1 * joint_error
+                    
+                    # BODY PULL: Pull body toward anchor point (helps body follow arm)
+                    body_pos = self.get_central_body_pos()
+                    body_to_anchor = anchor_pos - body_pos
+                    distance = np.linalg.norm(body_to_anchor)
+                    
+                    if distance > 0.4:
+                        body_pull_stiffness = 100.0
+                        body_damping_coef = 40.0  # Higher damping for body
+                        body_vel = self.data.qvel[0:3]
+                        
+                        body_force = body_pull_stiffness * body_to_anchor - body_damping_coef * body_vel
+                        self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                    
+                    # TRACK: Record deviation for anchor statistics
+                    if current_anchor_idx is not None and current_anchor_idx in anchor_deviation_history:
+                        anchor_deviation_history[current_anchor_idx]['deviations'].append(err_mag)
+                        if err_mag > anchor_deviation_history[current_anchor_idx]['max_deviation']:
+                            anchor_deviation_history[current_anchor_idx]['max_deviation'] = err_mag
+                    
+                    return err_mag
+                
                 if crawl_phase == 'reaching_anchor':
+                    # First phase: Left arm reaches first waypoint
                     phase_timer += 1
                     
-                    # BODY IS FREE - apply anchor force to stabilize if left arm is close
-                    # This simulates the arm pushing against the target point
-                    
-                    # Keep right arm in retracted position (zero velocity)
+                    # Keep right arm retracted
                     self.data.ctrl[self.right_arm_actuator_slice] = self.data.qpos[self.right_arm_qpos_slice]
                     
-                    # Apply IK to left arm
-                    if self.left_anchor_position is not None:
-                        self.left_target_position = self.left_anchor_position.copy()
+                    # Left arm reaches toward first waypoint
+                    if current_target is not None:
+                        self.left_target_position = current_target.copy()
                         left_error = self.apply_arm_control('left')
                         
-                        # Apply stabilizing force when close to anchor
+                        # Apply stabilizing force when close
                         if left_error < 0.3:
                             grip_stiffness = 3000.0
-                            grip_damping = 300.0
                             left_pos = self.get_left_gripper_pos()
-                            left_err = self.left_anchor_position - left_pos
-                            left_force = grip_stiffness * left_err
-                            self.data.xfrc_applied[self.left_ee_body_id, 0:3] = left_force
+                            left_err = current_target - left_pos
+                            self.data.xfrc_applied[self.left_ee_body_id, 0:3] = grip_stiffness * left_err
                         
-                        # Track best error
                         if left_error < best_error:
                             best_error = left_error
                         
-                        # Print progress periodically
                         if phase_timer % 100 == 0:
                             left_pos = self.get_left_gripper_pos()
                             body_pos = self.get_central_body_pos()
-                            print(f"  [{phase_timer:4d}] Left arm at ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f}) | Error: {left_error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+                            print(f"  [{phase_timer:4d}] Left→WP1 | Error: {left_error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
                         
-                        # SUCCESS: Left arm reached anchor
-                        if left_error < 0.05:
-                            print(f"\n✅ SUCCESS! Left arm ANCHORED with error: {left_error:.3f}m")
+                        # Success - anchored at first waypoint (relaxed threshold for reliability)
+                        if left_error < 0.10:
                             left_pos = self.get_left_gripper_pos()
-                            print(f"  Final position: ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f})")
-                            print(f"  Target anchor:  ({anchor[0]:.2f}, {anchor[1]:.2f}, {anchor[2]:.2f})")
-                            # Save anchored joint positions
-                            left_arm_anchored_joints = self.data.qpos[self.left_arm_qpos_slice].copy()
+                            print(f"\n✅ WP{current_waypoint_idx+1} REACHED by LEFT arm! Error: {left_error:.3f}m")
+                            
+                            # ANCHOR AT THE VALID SPHERE POSITION (the target waypoint)
+                            anchor_position = np.array(current_target)
                             self.left_arm_anchored = True
-                            # Use ACTUAL gripper position as anchor (not target)
-                            self.left_anchor_position = left_pos.copy()
-                            print(f"  🔒 Left arm LOCKED at anchor position: ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f})")
-                            crawl_phase = 'left_anchored'
-                            self._transition_state(RobotState.MOVING_RIGHT_ARM)
+                            self.left_anchor_position = anchor_position.copy()
+                            print(f"  🔒 LEFT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                            
+                            # Initialize anchor deviation tracking for this waypoint
+                            current_anchor_idx = current_waypoint_idx
+                            anchor_deviation_history[current_anchor_idx] = {
+                                'anchor_pos': anchor_position.copy(),
+                                'arm': 'left',
+                                'max_deviation': 0.0,
+                                'deviations': []
+                            }
+                            
+                            current_waypoint_idx += 1
+                            
+                            if current_waypoint_idx < total_waypoints:
+                                # Move to next waypoint with right arm
+                                current_target = waypoints[current_waypoint_idx]
+                                current_target_wall = waypoint_walls[current_waypoint_idx]
+                                is_final = current_waypoint_idx == total_waypoints - 1
+                                use_orientation_control = is_final
+                                moving_arm = 'right'
+                                anchored_arm = 'left'
+                                crawl_phase = 'reaching_waypoint'
+                                phase_timer = 0
+                                best_error = float('inf')
+                                print(f"  🔒 Left arm LOCKED")
+                                print(f"  ➡️  Right arm moving to WP{current_waypoint_idx+1}")
+                            else:
+                                crawl_phase = 'trajectory_complete'
+                                print(f"\n🎉 TRAJECTORY COMPLETE!")
                     
-                    # Timeout
                     if phase_timer >= settling_timeout:
-                        left_pos = self.get_left_gripper_pos()
-                        final_error = np.linalg.norm(anchor - left_pos)
-                        print(f"\n⚠️ Timeout after {phase_timer} steps")
-                        print(f"  Final error: {final_error:.3f}m | Best achieved: {best_error:.3f}m")
-                        print(f"  Left arm at: ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f})")
-                        print(f"  Target was:  ({anchor[0]:.2f}, {anchor[1]:.2f}, {anchor[2]:.2f})")
+                        print(f"\n⚠️ Timeout reaching WP1")
                         crawl_phase = 'failed'
-                        self._transition_state(RobotState.ERROR)
                 
-                elif crawl_phase == 'left_anchored':
-                    # LEFT ARM IS ANCHORED - HARD CONSTRAINT
-                    # Force left gripper to stay at anchor position
-                    
-                    # Apply strong force to keep gripper at anchor with CLAMPING
-                    grip_stiffness = 10000.0   # Moderate stiffness
-                    grip_damping = 2000.0      # High damping for stability
-                    max_force = 5000.0         # Maximum force to prevent instability
-                    left_pos = self.get_left_gripper_pos()
-                    left_err = self.left_anchor_position - left_pos
-                    left_vel_approx = (left_pos - getattr(self, '_prev_left_pos', left_pos)) / self.model.opt.timestep if hasattr(self, '_prev_left_pos') else np.zeros(3)
-                    self._prev_left_pos = left_pos.copy()
-                    left_force = grip_stiffness * left_err - grip_damping * left_vel_approx
-                    # Clamp force magnitude to prevent instability
-                    left_force_mag = np.linalg.norm(left_force)
-                    if left_force_mag > max_force:
-                        left_force = left_force * (max_force / left_force_mag)
-                    self.data.xfrc_applied[self.left_ee_body_id, 0:3] = left_force
-                    
-                    # Also apply IK to try to keep arm at anchor
-                    self.left_target_position = self.left_anchor_position.copy()
-                    self.apply_arm_control('left')
-                    
-                    # RIGHT ARM approaches second target
-                    if right_target is not None:
-                        right_arm_timer += 1
-                        self.right_target_position = right_target.copy()
-                        right_error = self.apply_arm_control('right')
-                        
-                        if right_error < right_arm_best_error:
-                            right_arm_best_error = right_error
-                        
-                        # Print progress
-                        if right_arm_timer % 100 == 0:
-                            right_pos = self.get_right_gripper_pos()
-                            body_pos = self.get_central_body_pos()
-                            left_hold = np.linalg.norm(left_err)
-                            print(f"  [{right_arm_timer:4d}] Right arm at ({right_pos[0]:.2f}, {right_pos[1]:.2f}, {right_pos[2]:.2f}) | Error: {right_error:.3f}m | Left hold: {left_hold:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
-                        
-                        # Check if right arm reached target
-                        if right_error < 0.05:
-                            print(f"\n✅ RIGHT ARM ANCHORED! Error: {right_error:.3f}m")
-                            right_pos = self.get_right_gripper_pos()
-                            print(f"  Right arm at: ({right_pos[0]:.2f}, {right_pos[1]:.2f}, {right_pos[2]:.2f})")
-                            print(f"  Target was:   ({right_target[0]:.2f}, {right_target[1]:.2f}, {right_target[2]:.2f})")
-                            # Save anchored joint positions
-                            right_arm_anchored_joints = self.data.qpos[self.right_arm_qpos_slice].copy()
-                            self.right_arm_anchored = True
-                            # Use ACTUAL gripper position as anchor (not target)
-                            self.right_anchor_position = right_pos.copy()
-                            print(f"  🔒 Right arm LOCKED at anchor position: ({right_pos[0]:.2f}, {right_pos[1]:.2f}, {right_pos[2]:.2f})")
-                            crawl_phase = 'both_anchored'
-                            self._transition_state(RobotState.GOAL_REACHED)
-                
-                elif crawl_phase == 'both_anchored':
-                    # BOTH ARMS ANCHORED - Hold for a moment, then release left arm
-                    right_arm_timer += 1
-                    
-                    # Apply strong anchor forces to both grippers with CLAMPING
-                    grip_stiffness = 10000.0
-                    grip_damping = 2000.0
-                    max_force = 5000.0
-                    
-                    left_pos = self.get_left_gripper_pos()
-                    left_err = self.left_anchor_position - left_pos
-                    left_vel_approx = (left_pos - getattr(self, '_prev_left_pos', left_pos)) / self.model.opt.timestep if hasattr(self, '_prev_left_pos') else np.zeros(3)
-                    self._prev_left_pos = left_pos.copy()
-                    left_force = grip_stiffness * left_err - grip_damping * left_vel_approx
-                    left_force_mag = np.linalg.norm(left_force)
-                    if left_force_mag > max_force:
-                        left_force = left_force * (max_force / left_force_mag)
-                    self.data.xfrc_applied[self.left_ee_body_id, 0:3] = left_force
-                    
-                    right_pos = self.get_right_gripper_pos()
-                    right_err = self.right_anchor_position - right_pos
-                    right_vel_approx = (right_pos - getattr(self, '_prev_right_pos', right_pos)) / self.model.opt.timestep if hasattr(self, '_prev_right_pos') else np.zeros(3)
-                    self._prev_right_pos = right_pos.copy()
-                    right_force = grip_stiffness * right_err - grip_damping * right_vel_approx
-                    right_force_mag = np.linalg.norm(right_force)
-                    if right_force_mag > max_force:
-                        right_force = right_force * (max_force / right_force_mag)
-                    self.data.xfrc_applied[self.right_ee_body_id, 0:3] = right_force
-                    
-                    # Apply IK to maintain anchor positions
-                    self.left_target_position = self.left_anchor_position.copy()
-                    self.apply_arm_control('left')
-                    self.right_target_position = self.right_anchor_position.copy()
-                    self.apply_arm_control('right')
-                    
-                    # Print periodically
-                    if right_arm_timer % 200 == 0:
-                        body_pos = self.get_central_body_pos()
-                        left_hold = np.linalg.norm(left_err)
-                        right_hold = np.linalg.norm(right_err)
-                        print(f"  [BOTH ANCHORED] Body at ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
-                        print(f"    Left hold: {left_hold:.3f}m | Right hold: {right_hold:.3f}m")
-                    
-                    # After stabilizing (500 steps), release left arm to reach next waypoint
-                    if right_arm_timer >= 500 and left_next_target is not None:
-                        print(f"\n🔓 RELEASING LEFT ARM to reach WP3")
-                        print(f"  Next target: ({left_next_target[0]:.2f}, {left_next_target[1]:.2f}, {left_next_target[2]:.2f})")
-                        self.left_arm_anchored = False
-                        self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0  # Remove anchor force
-                        crawl_phase = 'left_reaching_next'
-                        phase_timer = 0
-                        best_error = float('inf')
-                
-                elif crawl_phase == 'left_reaching_next':
-                    # LEFT ARM released, reaching next waypoint while RIGHT stays anchored
+                elif crawl_phase == 'reaching_waypoint':
+                    # Alternating arm reaches next waypoint
                     phase_timer += 1
                     
-                    # Keep RIGHT arm anchored with strong force
-                    grip_stiffness = 10000.0
-                    grip_damping = 2000.0
-                    max_force = 5000.0
+                    # Apply anchor force to the anchored arm
+                    if anchored_arm == 'left' and self.left_anchor_position is not None:
+                        apply_anchor_force('left', self.left_anchor_position, '_prev_left_pos')
+                        self.left_target_position = self.left_anchor_position.copy()
+                        # Only control last 2 joints of anchored arm to maintain anchor
+                        # First 5 joints can be adjusted to help moving arm reach
+                        self.apply_arm_control('left', anchored_mode=True)
+                    elif anchored_arm == 'right' and self.right_anchor_position is not None:
+                        apply_anchor_force('right', self.right_anchor_position, '_prev_right_pos')
+                        self.right_target_position = self.right_anchor_position.copy()
+                        self.apply_arm_control('right', anchored_mode=True)
                     
-                    right_pos = self.get_right_gripper_pos()
-                    right_err = self.right_anchor_position - right_pos
-                    right_vel_approx = (right_pos - getattr(self, '_prev_right_pos', right_pos)) / self.model.opt.timestep if hasattr(self, '_prev_right_pos') else np.zeros(3)
-                    self._prev_right_pos = right_pos.copy()
-                    right_force = grip_stiffness * right_err - grip_damping * right_vel_approx
-                    right_force_mag = np.linalg.norm(right_force)
-                    if right_force_mag > max_force:
-                        right_force = right_force * (max_force / right_force_mag)
-                    self.data.xfrc_applied[self.right_ee_body_id, 0:3] = right_force
-                    
-                    # IK for right arm to maintain anchor (but allow some slack if stuck)
-                    self.right_target_position = self.right_anchor_position.copy()
-                    
-                    # Check if we're stuck and need to release base joints on anchored arm
-                    # This allows the body to swing closer to the target
-                    right_arm_partial_release = getattr(self, '_right_arm_partial_release', False)
-                    
-                    if not right_arm_partial_release:
-                        # Normal control - full IK on right arm
-                        self.apply_arm_control('right')
+                    # Moving arm reaches toward target
+                    # Also adjust first 5 joints of anchored arm to help body positioning
+                    if moving_arm == 'left':
+                        self.left_target_position = current_target.copy()
+                        if use_orientation_control:
+                            error = self.apply_arm_control_with_orientation('left', current_target_wall)
+                        else:
+                            error = self.apply_arm_control('left')
+                        arm_pos = self.get_left_gripper_pos()
+                        
+                        # Use coordinated control when arm error > 0.15m to help body reposition
+                        if error > 0.15 and anchored_arm == 'right' and self.right_anchor_position is not None:
+                            self.apply_coordinated_arm_control('right', current_target, self.right_anchor_position)
                     else:
-                        # Partial release - only control last 4 joints (keep base 3 joints loose)
-                        # This allows body rotation/translation to help reach
-                        self.apply_arm_control('right', skip_base_joints=3)
+                        self.right_target_position = current_target.copy()
+                        if use_orientation_control:
+                            error = self.apply_arm_control_with_orientation('right', current_target_wall)
+                        else:
+                            error = self.apply_arm_control('right')
+                        arm_pos = self.get_right_gripper_pos()
+                        
+                        # Use coordinated control when arm error > 0.15m to help body reposition
+                        if error > 0.15 and anchored_arm == 'left' and self.left_anchor_position is not None:
+                            self.apply_coordinated_arm_control('left', current_target, self.left_anchor_position)
                     
-                    # LEFT ARM reaches toward next waypoint
-                    self.left_target_position = left_next_target.copy()
-                    left_error = self.apply_arm_control('left')
-                    
-                    if left_error < best_error:
-                        best_error = left_error
-                        stuck_counter = 0
+                    if error < best_error:
+                        best_error = error
+                        self._stuck_counter = 0
                     else:
-                        stuck_counter = getattr(self, '_stuck_counter', 0) + 1
-                        self._stuck_counter = stuck_counter
+                        self._stuck_counter = getattr(self, '_stuck_counter', 0) + 1
                     
-                    # If stuck for 500 steps with error > 0.3m, try partial release
-                    if stuck_counter > 500 and best_error > 0.3 and not right_arm_partial_release:
-                        print(f"\n⚠️ ARM STUCK - Enabling partial release on right arm base joints")
-                        print(f"  Current error: {left_error:.3f}m, Best: {best_error:.3f}m")
-                        self._right_arm_partial_release = True
-                        stuck_counter = 0
+                    # Partial release if stuck
+                    partial_release = getattr(self, '_partial_release', False)
+                    if self._stuck_counter > 500 and best_error > 0.3 and not partial_release:
+                        print(f"\n⚠️ ARM STUCK - Enabling partial release on {anchored_arm} arm")
+                        self._partial_release = True
                         self._stuck_counter = 0
                     
-                    # Print progress
                     if phase_timer % 100 == 0:
-                        left_pos = self.get_left_gripper_pos()
                         body_pos = self.get_central_body_pos()
-                        right_hold = np.linalg.norm(right_err)
-                        release_status = " [PARTIAL RELEASE]" if right_arm_partial_release else ""
-                        print(f"  [{phase_timer:4d}] Left arm at ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f}) | Error: {left_error:.3f}m | Right hold: {right_hold:.3f}m{release_status}")
+                        suffix = " [FINAL]" if use_orientation_control else ""
+                        print(f"  [{phase_timer:4d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){suffix}")
                     
-                    # Check if left arm reached target
-                    if left_error < 0.05:
-                        print(f"\n✅ LEFT ARM ANCHORED at WP3! Error: {left_error:.3f}m")
-                        left_pos = self.get_left_gripper_pos()
-                        print(f"  Left arm at: ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f})")
-                        print(f"  Target was:  ({left_next_target[0]:.2f}, {left_next_target[1]:.2f}, {left_next_target[2]:.2f})")
-                        self.left_arm_anchored = True
-                        self.left_anchor_position = left_pos.copy()
-                        print(f"  🔒 Left arm LOCKED at new anchor: ({left_pos[0]:.2f}, {left_pos[1]:.2f}, {left_pos[2]:.2f})")
-                        crawl_phase = 'locomotion_complete'
-                        print(f"\n🎉 LOCOMOTION CYCLE COMPLETE!")
-                        print(f"  Robot has moved from WP1 to WP3 using brachiation!")
-                        # Reset partial release state
-                        self._right_arm_partial_release = False
-                        self._stuck_counter = 0
+                    # Success - reached waypoint (must be close to target sphere)
+                    # Use tighter threshold for final waypoint, more relaxed for intermediate
+                    # NOTE: Threshold affects visual accuracy - gripper should be close to the anchor sphere
+                    is_final_waypoint = current_waypoint_idx == total_waypoints - 1
+                    success_threshold = 0.08 if is_final_waypoint else 0.15  # 8cm for final, 15cm for intermediate
                     
-                    # Timeout check
-                    if phase_timer >= 3000:
-                        print(f"\n⚠️ Left arm timeout reaching WP3")
-                        print(f"  Best error achieved: {best_error:.3f}m")
-                        crawl_phase = 'locomotion_complete'
-                        # Reset partial release state
-                        self._right_arm_partial_release = False
+                    if error < success_threshold:
+                        print(f"\n✅ WP{current_waypoint_idx+1} REACHED by {moving_arm.upper()} arm! Error: {error:.3f}m")
+                        
+                        # ANCHOR AT THE VALID SPHERE POSITION (the target waypoint)
+                        # NOT at the current arm position - this ensures we anchor at valid spheres only
+                        anchor_position = np.array(current_target)  # Use the target waypoint (valid sphere)
+                        
+                        if moving_arm == 'left':
+                            self.left_arm_anchored = True
+                            self.left_anchor_position = anchor_position.copy()
+                            print(f"  🔒 LEFT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                        else:
+                            self.right_arm_anchored = True
+                            self.right_anchor_position = anchor_position.copy()
+                            print(f"  🔒 RIGHT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                        
+                        # Initialize anchor deviation tracking for this waypoint
+                        current_anchor_idx = current_waypoint_idx
+                        anchor_deviation_history[current_anchor_idx] = {
+                            'anchor_pos': anchor_position.copy(),
+                            'arm': moving_arm,
+                            'max_deviation': 0.0,
+                            'deviations': []
+                        }
+                        
+                        current_waypoint_idx += 1
+                        self._partial_release = False
                         self._stuck_counter = 0
+                        
+                        if current_waypoint_idx < total_waypoints:
+                            # Prepare for next waypoint
+                            is_final = current_waypoint_idx == total_waypoints - 1
+                            
+                            # Release previous anchor, swap arms
+                            if anchored_arm == 'left':
+                                self.left_arm_anchored = False
+                                self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0
+                                print(f"  🔓 LEFT arm RELEASED")
+                            else:
+                                self.right_arm_anchored = False
+                                self.data.xfrc_applied[self.right_ee_body_id, 0:3] = 0
+                                print(f"  🔓 RIGHT arm RELEASED")
+                            
+                            # Swap arms
+                            moving_arm, anchored_arm = anchored_arm, moving_arm
+                            current_target = waypoints[current_waypoint_idx]
+                            current_target_wall = waypoint_walls[current_waypoint_idx]
+                            use_orientation_control = is_final
+                            
+                            print(f"  ➡️  {moving_arm.upper()} arm moving to WP{current_waypoint_idx+1}{' [FINAL - perpendicular approach]' if is_final else ''}")
+                            phase_timer = 0
+                            best_error = float('inf')
+                        else:
+                            # FINAL WAYPOINT REACHED - release the previous anchor
+                            # The arm that just reached the goal (moving_arm) is now anchored
+                            # The previous anchored_arm becomes free for screw task
+                            if anchored_arm == 'left':
+                                self.left_arm_anchored = False
+                                self.left_anchor_position = None
+                                self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0
+                                print(f"  🔓 LEFT arm RELEASED (now FREE for screw task)")
+                            else:
+                                self.right_arm_anchored = False
+                                self.right_anchor_position = None
+                                self.data.xfrc_applied[self.right_ee_body_id, 0:3] = 0
+                                print(f"  🔓 RIGHT arm RELEASED (now FREE for screw task)")
+                            
+                            crawl_phase = 'trajectory_complete'
+                            print(f"\n🎉 TRAJECTORY COMPLETE!")
+                            print(f"  Final position on {current_target_wall} wall")
+                            body_pos = self.get_central_body_pos()
+                            print(f"  Body at: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+                    
+                    if phase_timer >= settling_timeout:
+                        # Timeout - but DON'T proceed to next waypoint
+                        # Only print status update, keep trying
+                        if phase_timer == settling_timeout:
+                            print(f"\n⏳ Still reaching WP{current_waypoint_idx+1} (timeout reached, continuing...)")
+                            print(f"  Best error so far: {best_error:.3f}m")
+                        
+                        # Continue trying - reset timer but keep best_error
+                        # This allows infinite attempts until the arm is anchored
+                        if phase_timer % 1000 == 0:
+                            body_pos = self.get_central_body_pos()
+                            print(f"  [{phase_timer:5d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Best: {best_error:.3f}m")
                 
-                elif crawl_phase == 'locomotion_complete':
-                    # Both arms anchored at new positions, just maintain
+                elif crawl_phase == 'trajectory_complete':
+                    # FINAL POSITION: Lock anchored arm completely, free arm available for screw task
                     phase_timer += 1
                     
-                    grip_stiffness = 10000.0
-                    grip_damping = 2000.0
-                    max_force = 5000.0
+                    # Initialize final locking state
+                    if not hasattr(self, '_final_locked'):
+                        self._final_locked = True
+                        
+                        # Determine which arm reached the final waypoint (is anchored)
+                        # and which arm is free for screw task
+                        if self.left_anchor_position is not None and self.right_anchor_position is None:
+                            self._final_anchored_arm = 'left'
+                            self._final_free_arm = 'right'
+                            # Lock left arm joint positions (CURRENT values, not changed)
+                            self._final_anchored_joints = self.data.qpos[7:14].copy()
+                            print(f"\n  🔒 FINAL POSITION - ANCHORED ARM LOCKED")
+                            print(f"  🔒 LEFT arm joints FROZEN at current values")
+                            print(f"  🆓 RIGHT arm FREE for screw task approximation")
+                        elif self.right_anchor_position is not None and self.left_anchor_position is None:
+                            self._final_anchored_arm = 'right'
+                            self._final_free_arm = 'left'
+                            # Lock right arm joint positions
+                            self._final_anchored_joints = self.data.qpos[22:29].copy()
+                            print(f"\n  🔒 FINAL POSITION - ANCHORED ARM LOCKED")
+                            print(f"  🔒 RIGHT arm joints FROZEN at current values")
+                            print(f"  🆓 LEFT arm FREE for screw task approximation")
+                        else:
+                            # Both or neither anchored - lock both
+                            self._final_anchored_arm = 'both'
+                            self._final_free_arm = None
+                            self._final_anchored_joints_left = self.data.qpos[7:14].copy()
+                            self._final_anchored_joints_right = self.data.qpos[22:29].copy()
+                            print(f"\n  🔒 FINAL POSITION - BOTH ARMS LOCKED")
+                        
+                        # Store final body position
+                        self._final_body_pos = self.get_central_body_pos().copy()
+                        self._final_body_quat = self.data.qpos[3:7].copy()
+                        print(f"  🔒 Body locked at: ({self._final_body_pos[0]:.2f}, {self._final_body_pos[1]:.2f}, {self._final_body_pos[2]:.2f})")
+                        
+                        # Mark trajectory as successful
+                        trajectory_success = True
                     
-                    # Maintain both anchors
-                    left_pos = self.get_left_gripper_pos()
-                    if self.left_anchor_position is not None:
-                        left_err = self.left_anchor_position - left_pos
-                        left_force = grip_stiffness * left_err
-                        left_force_mag = np.linalg.norm(left_force)
-                        if left_force_mag > max_force:
-                            left_force = left_force * (max_force / left_force_mag)
-                        self.data.xfrc_applied[self.left_ee_body_id, 0:3] = left_force
+                    # FORCE LOCK anchored arm joints - zero velocity, restore positions
+                    if self._final_anchored_arm == 'left':
+                        # Force left arm to locked positions
+                        self.data.qpos[7:14] = self._final_anchored_joints.copy()
+                        self.data.qvel[6:13] = 0.0  # Zero velocities
+                        self.data.ctrl[self.left_arm_actuator_slice] = self._final_anchored_joints.copy()
+                        # Free arm (right) can be controlled - apply simple retraction
+                        # (In real use, user would control this for screw task)
+                        if phase_timer < 200:  # Just for first few seconds, hold position
+                            self.data.ctrl[self.right_arm_actuator_slice] = self.data.qpos[22:29].copy()
+                    elif self._final_anchored_arm == 'right':
+                        # Force right arm to locked positions
+                        self.data.qpos[22:29] = self._final_anchored_joints.copy()
+                        self.data.qvel[21:28] = 0.0  # Zero velocities
+                        self.data.ctrl[self.right_arm_actuator_slice] = self._final_anchored_joints.copy()
+                        # Free arm (left) can be controlled
+                        if phase_timer < 200:
+                            self.data.ctrl[self.left_arm_actuator_slice] = self.data.qpos[7:14].copy()
+                    else:
+                        # Both arms locked
+                        self.data.qpos[7:14] = self._final_anchored_joints_left.copy()
+                        self.data.qpos[22:29] = self._final_anchored_joints_right.copy()
+                        self.data.qvel[6:13] = 0.0
+                        self.data.qvel[21:28] = 0.0
+                        self.data.ctrl[self.left_arm_actuator_slice] = self._final_anchored_joints_left.copy()
+                        self.data.ctrl[self.right_arm_actuator_slice] = self._final_anchored_joints_right.copy()
                     
-                    right_pos = self.get_right_gripper_pos()
-                    right_err = self.right_anchor_position - right_pos
-                    right_force = grip_stiffness * right_err
-                    right_force_mag = np.linalg.norm(right_force)
-                    if right_force_mag > max_force:
-                        right_force = right_force * (max_force / right_force_mag)
-                    self.data.xfrc_applied[self.right_ee_body_id, 0:3] = right_force
+                    # Force-restore body position
+                    self.data.qpos[0:3] = self._final_body_pos.copy()
+                    self.data.qpos[3:7] = self._final_body_quat.copy()
+                    self.data.qvel[0:6] = 0.0
                     
                     if phase_timer % 500 == 0:
                         body_pos = self.get_central_body_pos()
-                        print(f"  [COMPLETE] Body at ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+                        free_str = f" | FREE arm: {self._final_free_arm.upper()}" if self._final_free_arm else ""
+                        print(f"  [HOLDING] Body at ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){free_str}")
+                
+                elif crawl_phase == 'failed':
+                    # Error state - just hold position
+                    phase_timer += 1
+                    if phase_timer % 500 == 0:
+                        print(f"  [FAILED] Holding position...")
                 
                 # ============================================================
                 # END STATE MACHINE
@@ -1639,11 +2326,226 @@ class WallCrawlerMuJoCoSimulation:
                 if time_until_next > 0:
                     time.sleep(time_until_next)
         
+        # ================================================================
+        # END OF SIMULATION - SUMMARY AND ANALYSIS
+        # ================================================================
         print("\n👋 Visualization ended")
+        
+        # Print success status
+        print(f"\n{'='*60}")
+        print("TRAJECTORY EXECUTION SUMMARY")
+        print(f"{'='*60}")
+        
+        if trajectory_success:
+            print("✅ TRAJECTORY COMPLETED SUCCESSFULLY!")
+            reason = "completed"
+        else:
+            print("❌ TRAJECTORY DID NOT COMPLETE")
+            print(f"   Reached waypoint {current_waypoint_idx} of {total_waypoints}")
+            reason = f"stopped at WP{current_waypoint_idx+1}"
+        
+        # Record run result for multi-run statistics
+        history = record_run_result(
+            success=trajectory_success,
+            waypoints_reached=current_waypoint_idx if trajectory_success else current_waypoint_idx,
+            total_waypoints=total_waypoints,
+            reason=reason
+        )
+        
+        # Show cumulative success rate
+        if history['total'] > 0:
+            success_rate = (history['successes'] / history['total']) * 100
+            print(f"\n📊 CUMULATIVE SUCCESS RATE: {history['successes']}/{history['total']} ({success_rate:.1f}%)")
+        
+        # Print anchor deviation statistics
+        print(f"\n{'='*60}")
+        print("ANCHOR DEVIATION ANALYSIS")
+        print(f"{'='*60}")
+        print(f"{'WP':>4} | {'Arm':>6} | {'Max Dev (m)':>12} | {'Avg Dev (m)':>12} | {'Samples':>8}")
+        print("-" * 60)
+        
+        max_deviations = []
+        wp_labels = []
+        
+        for wp_idx in sorted(anchor_deviation_history.keys()):
+            data = anchor_deviation_history[wp_idx]
+            arm = data['arm']
+            max_dev = data['max_deviation']
+            deviations = data['deviations']
+            avg_dev = np.mean(deviations) if deviations else 0.0
+            n_samples = len(deviations)
+            
+            max_deviations.append(max_dev)
+            wp_labels.append(f"WP{wp_idx+1}\n({arm[0].upper()})")
+            
+            print(f"{wp_idx+1:>4} | {arm.upper():>6} | {max_dev:>12.4f} | {avg_dev:>12.4f} | {n_samples:>8}")
+        
+        print("-" * 60)
+        
+        # Create matplotlib graph of max deviations
+        if max_deviations:
+            try:
+                import matplotlib
+                # Try to use TkAgg backend for interactive display
+                try:
+                    matplotlib.use('TkAgg')
+                except:
+                    pass  # Use default backend if TkAgg not available
+                import matplotlib.pyplot as plt
+                
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+                
+                # Bar chart of max deviations
+                colors = ['#2196F3' if 'L' in label else '#FF9800' for label in wp_labels]
+                bars = ax1.bar(range(len(max_deviations)), max_deviations, color=colors, edgecolor='black', linewidth=1.2)
+                ax1.set_xticks(range(len(max_deviations)))
+                ax1.set_xticklabels(wp_labels)
+                ax1.set_xlabel('Waypoint (Arm)', fontsize=12)
+                ax1.set_ylabel('Max End-Effector Deviation (m)', fontsize=12)
+                ax1.set_title('Maximum EE Deviation from Anchor Point per Waypoint', fontsize=14, fontweight='bold')
+                ax1.axhline(y=0.05, color='green', linestyle='--', linewidth=1.5, label='Good (<5cm)')
+                ax1.axhline(y=0.10, color='orange', linestyle='--', linewidth=1.5, label='Acceptable (<10cm)')
+                ax1.axhline(y=0.20, color='red', linestyle='--', linewidth=1.5, label='Limit (20cm)')
+                ax1.legend(loc='upper right')
+                ax1.set_ylim(0, max(0.25, max(max_deviations) * 1.2))
+                ax1.grid(axis='y', alpha=0.3)
+                
+                # Add value labels on bars
+                for bar, val in zip(bars, max_deviations):
+                    height = bar.get_height()
+                    ax1.annotate(f'{val:.3f}m',
+                                xy=(bar.get_x() + bar.get_width() / 2, height),
+                                xytext=(0, 3),
+                                textcoords="offset points",
+                                ha='center', va='bottom', fontsize=9)
+                
+                # Time series of deviations (if we have enough data)
+                all_deviations = []
+                all_wp_indices = []
+                for wp_idx in sorted(anchor_deviation_history.keys()):
+                    devs = anchor_deviation_history[wp_idx]['deviations']
+                    all_deviations.extend(devs)
+                    all_wp_indices.extend([wp_idx] * len(devs))
+                
+                if all_deviations:
+                    # Color-code by waypoint
+                    scatter_colors = plt.cm.viridis(np.array(all_wp_indices) / max(all_wp_indices) if max(all_wp_indices) > 0 else [0.5] * len(all_wp_indices))
+                    ax2.scatter(range(len(all_deviations)), all_deviations, c=all_wp_indices, cmap='viridis', alpha=0.5, s=2)
+                    ax2.set_xlabel('Time Step (during anchoring)', fontsize=12)
+                    ax2.set_ylabel('EE Deviation from Anchor (m)', fontsize=12)
+                    ax2.set_title('End-Effector Deviation Over Time (All Anchors)', fontsize=14, fontweight='bold')
+                    ax2.axhline(y=0.05, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
+                    ax2.axhline(y=0.10, color='orange', linestyle='--', linewidth=1.5, alpha=0.7)
+                    ax2.set_ylim(0, max(0.15, max(all_deviations) * 1.2) if all_deviations else 0.15)
+                    ax2.grid(alpha=0.3)
+                    
+                    # Add colorbar
+                    sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=min(all_wp_indices), vmax=max(all_wp_indices)))
+                    sm.set_array([])
+                    cbar = plt.colorbar(sm, ax=ax2)
+                    cbar.set_label('Waypoint Index')
+                
+                plt.suptitle(f"Anchor Stability Analysis - {'SUCCESS' if trajectory_success else 'INCOMPLETE'}", 
+                           fontsize=16, fontweight='bold', y=1.02)
+                plt.tight_layout()
+                
+                # Save plot to file first (always works)
+                plot_filename = "anchor_deviation_analysis.png"
+                plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+                print(f"\n📊 Plot saved to: {plot_filename}")
+                
+                # Try to display interactively
+                print("   Displaying graph window...")
+                print("   (Close the graph window to exit)")
+                try:
+                    plt.show(block=True)
+                except Exception as show_err:
+                    print(f"   Note: Interactive display not available ({show_err})")
+                    print(f"   View the saved file: {plot_filename}")
+                
+            except ImportError as ie:
+                print(f"\n⚠️ matplotlib not available for plotting: {ie}")
+            except Exception as e:
+                print(f"\n⚠️ Error creating plot: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _render_overlays(self, viewer):
         """Legacy method - replaced by _render_visualization_geoms"""
         pass
+
+
+# ============================================================================
+# MULTI-RUN SUCCESS TRACKING
+# ============================================================================
+
+def load_run_history():
+    """Load run history from file"""
+    import json
+    history_file = "run_history.json"
+    try:
+        with open(history_file, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'runs': [], 'total': 0, 'successes': 0}
+
+def save_run_history(history):
+    """Save run history to file"""
+    import json
+    history_file = "run_history.json"
+    with open(history_file, 'w') as f:
+        json.dump(history, f, indent=2)
+
+def record_run_result(success: bool, waypoints_reached: int, total_waypoints: int, reason: str = ""):
+    """Record the result of a run"""
+    import datetime
+    history = load_run_history()
+    
+    run_record = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'success': success,
+        'waypoints_reached': waypoints_reached,
+        'total_waypoints': total_waypoints,
+        'reason': reason
+    }
+    
+    history['runs'].append(run_record)
+    history['total'] += 1
+    if success:
+        history['successes'] += 1
+    
+    save_run_history(history)
+    return history
+
+def print_success_rate():
+    """Print the cumulative success rate across all runs"""
+    history = load_run_history()
+    
+    print(f"\n{'='*60}")
+    print("MULTI-RUN SUCCESS RATE")
+    print(f"{'='*60}")
+    
+    if history['total'] == 0:
+        print("No runs recorded yet.")
+        return
+    
+    success_rate = (history['successes'] / history['total']) * 100
+    print(f"Total Runs: {history['total']}")
+    print(f"Successful: {history['successes']}")
+    print(f"Failed: {history['total'] - history['successes']}")
+    print(f"Success Rate: {success_rate:.1f}%")
+    
+    # Show last 5 runs
+    recent_runs = history['runs'][-5:]
+    if recent_runs:
+        print(f"\nLast {len(recent_runs)} runs:")
+        for i, run in enumerate(recent_runs, 1):
+            status = "✅" if run['success'] else "❌"
+            wp_info = f"{run['waypoints_reached']}/{run['total_waypoints']}"
+            reason = f" ({run['reason']})" if run.get('reason') else ""
+            print(f"  {i}. {status} WP: {wp_info}{reason}")
+    
+    print(f"{'='*60}")
 
 
 # ============================================================================
@@ -1658,16 +2560,18 @@ def main():
     print("Workspace Mapping & Path Planning Visualization")
     print("="*70)
     
+    # Show previous run statistics
+    print_success_rate()
+    
     try:
         # Create simulation
         sim = WallCrawlerMuJoCoSimulation(model_path="dual_arm_robot.xml")
         
-        # Define start and goal positions - ADJUSTED for easier reach
-        # ISS Module dimensions: X(-2.2 to 4.0), Y(-0.6 to 1.8), Z(0 to 2.0)
-        # Start: On the FRONT wall (y=1.8), HIGHER for easier arm reach
-        start_pos = (1.0, 1.8, 1.4)  # Front wall, HIGHER (Z=1.4 vs 1.0)
+        # Define start and goal positions - HIGHER for ceiling-based path
+        # This matches the robot's default starting position
+        start_pos = (1.0, 1.8, 1.4)  # Front wall, high
         
-        # Goal: On the BACK wall (y=-0.6), different X position
+        # Goal: On the BACK wall (y=-0.6)
         goal_pos = (2.0, -0.6, 1.4)   # Back wall, same height
         
         # Set start and goal (this triggers path planning)
@@ -1678,7 +2582,8 @@ def main():
         print("The robot will be displayed with the planned path.")
         print("(Arm control will be implemented in Phase 2)")
         
-        sim.run_visualization()
+        # Run with duration limit to ensure summary/plotting is shown
+        sim.run_visualization(duration=60)
         
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")
