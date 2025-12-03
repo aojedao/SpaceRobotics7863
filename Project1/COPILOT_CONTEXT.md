@@ -4,125 +4,102 @@
 Dual-arm wall-crawler robot simulation for ISS module traversal using MuJoCo physics engine.
 The robot alternates between two KUKA iiwa14 arms with Robotiq 2F85 grippers to traverse walls.
 
-## Current State (December 2, 2025)
+## Current State (December 3, 2025)
 
-### ⚠️ KNOWN ISSUES - NEED FIXING
+### ⚠️ CRITICAL ISSUE - FORCED ACCEPTANCE IS FAKE COMPLETION
 
-1. **Trajectories Not Completing Successfully**
-   - Robot often fails to reach waypoints within thresholds
-   - Success rate is low (~50% or less)
-   - IK solver may be getting stuck in local minima
+**User Feedback:** "What is forced acceptance? It seems to fake completing a trajectory but it doesn't."
 
-2. **Recovery System Not Working Properly**
-   - Current implementation: release control for 10 seconds, retry up to 10 times
-   - The "release control" approach is NOT effective
-   - Simply setting `ctrl[:] = 0` doesn't help the robot recover
-   - Need a better recovery strategy (e.g., random perturbation, backtracking, different IK seed)
+**Problem Explanation:**
+The current "forced acceptance" mechanism is a WORKAROUND, not a real solution:
+- When the robot gets stuck and can't reach a waypoint within the threshold (e.g., 15-20cm)
+- After a timeout, it "accepts" the position even if error is up to 50-70cm away
+- This marks the waypoint as "complete" but the robot ISN'T actually at the waypoint
+- The trajectory "completes" on paper but the robot hasn't actually traversed the path correctly
 
-3. **Stuck Detection Triggers But Recovery Fails**
-   - 30-second timeout detects stuck conditions correctly
-   - But the recovery action (releasing control) doesn't help robot escape local minima
-   - Robot just drifts or stays stuck after release
+**Why This Is Bad:**
+1. Robot may be 50cm+ away from where it should be anchored
+2. Subsequent waypoints become harder to reach (error compounds)
+3. The screw task at the end happens at wrong location
+4. Success metrics are misleading - "60% success" doesn't mean 60% correct trajectories
+
+### Current Forced Acceptance Thresholds (THESE ARE TOO LENIENT)
+```python
+success_threshold = 0.15 if is_final else 0.20  # Normal acceptance (15-20cm)
+forced_accept_threshold = 0.50  # Accepts at 50cm if stuck
+# After 2+ recovery attempts: accepts at 60cm
+# After 6000+ steps: accepts at 70cm (!)
+```
+
+### 180° Recovery Strategy (Implemented but Not Enough)
+- When stuck, rotates first joint by 180° to escape local minima
+- Sometimes helps, but often robot still can't reach the target
+- The IK solver itself may have fundamental issues
+
+### What Actually Needs To Be Fixed
+
+1. **The IK Controller Itself** - May be stuck in singularities or local minima
+   - Consider using a different IK approach (e.g., CCD, FABRIK)
+   - Add null-space optimization to escape singularities
+   - Implement proper singularity detection and avoidance
+
+2. **Path Planning** - Some waypoints may be unreachable
+   - The A* planner uses effective_reach = 0.75m but actual IK fails
+   - Need to validate reachability BEFORE accepting a path
+   - Consider workspace analysis to prune unreachable positions
+
+3. **Remove Forced Acceptance** - It masks the real problem
+   - Either reach the waypoint properly OR fail honestly
+   - Don't fake success with 50cm+ errors
 
 ### What's Implemented (Partially Working)
 
 1. **Random Goal Generation**: Goals randomly selected from 5 walls
-   - Front, Back, Left, Right, and Ceiling walls supported
-   - Uses ISS_MODULE bounds for valid positions
-
-2. **Complete Route Visualization**: All waypoints shown with color coding
-   - 🟢 Green spheres: Completed waypoints
-   - 🟡 Yellow sphere: Current target waypoint
-   - 🔵 Blue spheres: Upcoming waypoints
-   - Blue lines connect waypoints showing planned path
-
-3. **Trajectory Error Plotting**: Now generates plots correctly
-   - Fixed: Trajectory plot was nested inside anchor deviation block
-   - Now plots independently to `trajectory_error_analysis.png`
-
-4. **Screw Task at Goal** (when trajectory completes):
-   - Screw model spawns at final goal position
-   - Active arm's joint7 rotates 3 full turns at 0.5 rad/s
-
-5. **Torque Balancing**:
-   - Free arm applies 30% counter-torque on joint7 during screw task
-
-6. **Per-Joint Gain Scaling**:
-   - Joints 1-2: 1.8x multiplier (stronger for base positioning)
-   - Joints 3-4: 1.0x (standard)
-   - Joints 5-6: 0.8x (reduced for wrist)
-   - Joint 7: 0.6x (lowest for end-effector precision)
+2. **Complete Route Visualization**: Color-coded waypoints
+3. **Trajectory Error Plotting**: Non-blocking with 3-second timeout
+4. **180° Recovery**: Rotates joint1 when stuck (helps sometimes)
+5. **Per-Joint Gain Scaling**: [2.0, 1.8, 1.2, 1.0, 1.0, 0.8, 0.6]
 
 ### Technical Configuration
 
 #### IK Controller Gains
 ```python
-kp_position = 500.0          # Position gain
-kd_position = 15.0           # Damping gain  
+kp_position = 400.0          # Position gain
+kd_position = 18.0           # Damping gain  
 lambda_dls = 0.012           # Damped least squares regularization
-joint_gain_scaling = [1.8, 1.8, 1.0, 1.0, 0.8, 0.8, 0.6]  # Per-joint multipliers
+joint_gain_scale = [2.0, 1.8, 1.2, 1.0, 1.0, 0.8, 0.6]
 ```
 
-#### Success Thresholds
+#### Current (Broken) Success Thresholds
 ```python
-final_threshold = 0.12       # 12cm for final waypoint
-intermediate_threshold = 0.18 # 18cm for intermediate waypoints
-forced_progress_threshold = 0.50  # 50cm emergency threshold
-```
-
-#### Stuck Detection Parameters (NEEDS IMPROVEMENT)
-```python
-stuck_timeout = 30.0         # Seconds without progress - works
-max_recovery_attempts = 10   # Maximum retry count
-release_duration = 10.0      # Seconds to release control - NOT EFFECTIVE
+success_threshold = 0.15-0.20  # What it SHOULD be
+forced_accept_threshold = 0.50-0.70  # What it ACTUALLY accepts (BAD)
 ```
 
 ### Key Files
 
-#### wall_crawler_mujoco.py (~3061 lines)
-Main simulation file containing:
-- `WallCrawlerController` class with state machine
+#### wall_crawler_mujoco.py (~3122 lines)
+- Lines 2315-2375: Forced acceptance logic (NEEDS REMOVAL/FIX)
 - `apply_arm_control()`: Per-joint gain scaling
 - `_render_visualization_geoms()`: Route visualization
-- Stuck detection in `reaching_waypoint` phase
-- Screw spawning and rotation in `trajectory_complete` phase
 
 #### dual_arm_robot.xml
-MuJoCo model with:
-- Two KUKA iiwa14 arms
-- Robotiq 2F85 grippers
-- Screw body (hidden at pos="100 100 100" until spawned)
-
-### State Machine Phases
-1. `reaching_anchor`: Moving arm approaches current waypoint
-2. `reaching_waypoint`: Same as above, with stuck detection
-3. `trajectory_complete`: Screw spawning and rotation task
+- Two KUKA iiwa14 arms + Robotiq 2F85 grippers
+- Screw body (hidden until spawned)
 
 ### Running the Simulation
 ```bash
 cd /home/aojedao/Documents/NYU/SpaceRobotics/SpaceRobotics7863/Project1
-/home/aojedao/miniconda3/bin/conda run -n space-robotics --no-capture-output python wall_crawler_mujoco.py
+conda activate space-robotics 
+python wall_crawler_mujoco.py
 ```
 
 ### TODO - Priority Fixes Needed
 
-1. **Fix Recovery Strategy** - The current "release control" approach doesn't work
-   - Options to try:
-     - Random joint perturbation to escape local minima
-     - Backtrack to previous waypoint and retry
-     - Use different IK seed/configuration
-     - Apply small random torques instead of zero
-     - Temporarily increase gains to "push through"
-
-2. **Improve Trajectory Success Rate**
-   - May need to adjust thresholds
-   - Consider adaptive thresholds based on distance
-   - Better path planning to avoid unreachable configurations
-
-3. **Debug Why IK Gets Stuck**
-   - Log joint configurations when stuck
-   - Visualize Jacobian condition number
-   - Check for singularities
+1. **REMOVE forced acceptance** - Stop faking success
+2. **Fix the IK solver** - Address why it gets stuck
+3. **Validate path reachability** - Don't plan unreachable paths
+4. **Honest failure reporting** - If it can't reach, say so
 
 ### ISS Module Bounds
 ```python
@@ -132,7 +109,3 @@ ISS_MODULE = {
     'z_min': 0.1,  'z_max': 2.2   # 2.1m height
 }
 ```
-
-### Generated Plots
-1. `anchor_deviation_analysis.png` - Anchor stability per waypoint
-2. `trajectory_error_analysis.png` - Tracking error with initial vs final bars (NOW WORKING)
