@@ -3,7 +3,13 @@
 MuJoCo-Based Dual-Arm Wall-Crawler Simulation
 
 This simulation uses the dual_arm_robot.xml MuJoCo environment to implement
-the wall-crawling algorithm from wall_crawler_iss_module.py.
+the wall-crawling algorithm for an ISS module inspection robot.
+
+MODULAR ARCHITECTURE:
+=====================
+This main file orchestrates the simulation, importing from:
+- arm_controller.py: ArmController class with IK, gripper, and anchor management
+- visualization.py: SimulationLogger, PlotGenerator, SceneRenderer
 
 Phase 1: Workspace Visualization & State Machine
 - Map workspace positions on walls
@@ -31,6 +37,17 @@ from typing import List, Tuple, Optional, Dict
 import heapq
 from scipy.spatial.transform import Rotation
 
+# Import modular components (optional - for future refactoring)
+# These modules contain extracted functionality that can be used
+# to simplify this main file in future iterations
+try:
+    from arm_controller import ArmController, ArmControllerConfig
+    from visualization import SimulationLogger, PlotGenerator, SceneRenderer, generate_flow_diagram
+    MODULES_AVAILABLE = True
+except ImportError:
+    MODULES_AVAILABLE = False
+    print("Note: Modular components not loaded - using inline implementations")
+
 
 # ============================================================================
 # ENVIRONMENT CONFIGURATION - Based on dual_arm_robot.xml
@@ -57,15 +74,13 @@ ISS_WIDTH = ISS_MODULE['x_max'] - ISS_MODULE['x_min']   # 6.0m
 ISS_DEPTH = ISS_MODULE['y_max'] - ISS_MODULE['y_min']   # 2.2m (was 2.4m)
 ISS_HEIGHT = ISS_MODULE['z_max'] - ISS_MODULE['z_min']  # 2.3m (was 2.2m)
 
-# DUAL ARM CONFIGURATION
-LEFT_ARM_OFFSET = -0.25   # X offset from central body
-RIGHT_ARM_OFFSET = 0.25   # X offset from central body
-ARM_SEPARATION = 0.5      # 0.5m between arms
+# DUAL ARM CONFIGURATION - Side-mounted arms (parallel, opposite directions)
+# Left arm on front side of box (-Y), Right arm on back side (+Y)
+LEFT_ARM_OFFSET = -0.15   # Y offset from central body (front side)
+RIGHT_ARM_OFFSET = 0.15   # Y offset from central body (back side)
+ARM_SEPARATION = 0.3      # 0.3m between arms (Y direction)
 
 # KUKA iiwa14 workspace
-# KUKA spec: 0.82m reach from A1 axis (arm only)
-# With Robotiq 2F85 gripper attached: ~1.25m total reach from A1 to gripper center
-# For path planning we use full reach
 KUKA_REACH = 1.25  # meters (including gripper)
 
 # For visualization, we center the workspace sphere at link4 (elbow)
@@ -537,6 +552,7 @@ class WallCrawlerMuJoCoSimulation:
         self.locked_body_quat = None       # Locked body orientation when anchored
         self.locked_left_arm_joints = None # Locked left arm joint positions when anchored
         
+        #End Effector position for anchoring
         print(f"✓ Left EE body ID: {self.left_ee_body_id}")
         print(f"✓ Right EE body ID: {self.right_ee_body_id}")
         print(f"✓ Gripper actuators: Left={self.left_gripper_actuator_idx}, Right={self.right_gripper_actuator_idx}")
@@ -767,9 +783,13 @@ class WallCrawlerMuJoCoSimulation:
     def detect_arm_crossing(self, verbose: bool = False) -> Tuple[bool, float]:
         """Detect if the arms are crossing each other.
         
+        With side-mounted arms (Y-axis):
+        - Left arm base is at body_y - 0.15 (front side)
+        - Right arm base is at body_y + 0.15 (back side)
+        
         Arms are considered crossing when:
-        1. Left gripper is on the right side of body center (positive local X)
-        2. Right gripper is on the left side of body center (negative local X)
+        1. Left gripper crosses to the back side (positive local Y)
+        2. Right gripper crosses to the front side (negative local Y)
         3. Or the grippers are very close to each other
         
         Args:
@@ -798,20 +818,19 @@ class WallCrawlerMuJoCoSimulation:
         left_rel = left_grip - body_pos
         right_rel = right_grip - body_pos
         
-        # Local X coordinates (positive = right side of body, negative = left side)
+        # Local X coordinates
         left_local_x = left_rel[0] * cos_yaw - left_rel[1] * sin_yaw
         right_local_x = right_rel[0] * cos_yaw - right_rel[1] * sin_yaw
         
-        # Local Y coordinates for diagnostics
+        # Local Y coordinates (negative = front side, positive = back side)
         left_local_y = left_rel[0] * sin_yaw + left_rel[1] * cos_yaw
         right_local_y = right_rel[0] * sin_yaw + right_rel[1] * cos_yaw
         
-        # Check for crossing:
-        # Left arm should have negative local X (left side)
-        # Right arm should have positive local X (right side)
-        # Use larger thresholds - only flag when arms REALLY cross
-        left_on_wrong_side = left_local_x > 0.2   # Left gripper significantly on right side
-        right_on_wrong_side = right_local_x < -0.2  # Right gripper significantly on left side
+        # Check for crossing (Y-axis based for side-mounted arms):
+        # Left arm should have negative local Y (front side)
+        # Right arm should have positive local Y (back side)
+        left_on_wrong_side = left_local_y > 0.2   # Left gripper on back side
+        right_on_wrong_side = right_local_y < -0.2  # Right gripper on front side
         
         # Also check if grippers are dangerously close (collision risk)
         gripper_distance = np.linalg.norm(left_grip - right_grip)
@@ -824,8 +843,8 @@ class WallCrawlerMuJoCoSimulation:
         severity = 0.0
         if left_on_wrong_side and right_on_wrong_side:
             # Both arms on wrong side - real crossing
-            severity += min((left_local_x - 0.1) / 0.4, 0.5)
-            severity += min((-right_local_x - 0.1) / 0.4, 0.5)
+            severity += min((left_local_y - 0.1) / 0.4, 0.5)
+            severity += min((-right_local_y - 0.1) / 0.4, 0.5)
         if grippers_too_close:
             severity += (0.15 - gripper_distance) / 0.15  # Closer = worse
         
@@ -844,11 +863,11 @@ class WallCrawlerMuJoCoSimulation:
                 print(f"  ╟──────────────────────────────────────────────────────────╢")
                 print(f"  ║ LEFT Gripper (world):  ({left_grip[0]:.3f}, {left_grip[1]:.3f}, {left_grip[2]:.3f})")
                 print(f"  ║ LEFT Gripper (local):  X={left_local_x:+.3f}, Y={left_local_y:+.3f}")
-                print(f"  ║   → Should be X < -0.2 | {'❌ ON WRONG SIDE' if left_on_wrong_side else '✓ OK'}")
+                print(f"  ║   → Should be Y < -0.2 (front) | {'❌ ON WRONG SIDE' if left_on_wrong_side else '✓ OK'}")
                 print(f"  ╟──────────────────────────────────────────────────────────╢")
                 print(f"  ║ RIGHT Gripper (world): ({right_grip[0]:.3f}, {right_grip[1]:.3f}, {right_grip[2]:.3f})")
                 print(f"  ║ RIGHT Gripper (local): X={right_local_x:+.3f}, Y={right_local_y:+.3f}")
-                print(f"  ║   → Should be X > +0.2 | {'❌ ON WRONG SIDE' if right_on_wrong_side else '✓ OK'}")
+                print(f"  ║   → Should be Y > +0.2 (back)  | {'❌ ON WRONG SIDE' if right_on_wrong_side else '✓ OK'}")
                 print(f"  ╟──────────────────────────────────────────────────────────╢")
                 print(f"  ║ Gripper Distance: {gripper_distance:.3f}m {'⚠️ TOO CLOSE' if grippers_too_close else ''}")
                 print(f"  ║ Crossing Severity: {severity:.2f} / 1.00")
@@ -870,10 +889,9 @@ class WallCrawlerMuJoCoSimulation:
         """Compute the ideal first joint angle to orient the arm toward target.
         
         The first joint (shoulder rotation) determines the direction the arm points.
-        We want the arm to point toward the target without crossing the other arm.
-        
-        Left arm: base at body_x - 0.25, points best in range [-π, 0] (left side)
-        Right arm: base at body_x + 0.25, points best in range [0, π] (right side)
+        Arms are now side-mounted on the Y-axis:
+        - Left arm: base at body_y - 0.15 (front side)
+        - Right arm: base at body_y + 0.15 (back side)
         
         Args:
             arm: 'left' or 'right'
@@ -886,11 +904,11 @@ class WallCrawlerMuJoCoSimulation:
         body_pos = self.get_central_body_pos()
         body_quat = self.data.qpos[3:7]
         
-        # Get arm base position (offset from body)
+        # Get arm base position (offset from body) - arms mounted on Y-axis sides
         if arm == 'left':
-            arm_base_offset = np.array([-0.25, 0, 0])  # Left arm is -X from body
+            arm_base_offset = np.array([0, LEFT_ARM_OFFSET, 0])  # Left arm is -Y from body (front side)
         else:
-            arm_base_offset = np.array([0.25, 0, 0])   # Right arm is +X from body
+            arm_base_offset = np.array([0, RIGHT_ARM_OFFSET, 0])  # Right arm is +Y from body (back side)
         
         # Arm base in world coordinates (simplified - assume body aligned with world)
         arm_base = body_pos + arm_base_offset
@@ -1700,18 +1718,15 @@ class WallCrawlerMuJoCoSimulation:
             module_center_z = (ISS_MODULE['z_min'] + ISS_MODULE['z_max']) / 2  # 1.15
             
             if self.start_position and self.current_path and len(self.current_path) > 0:
-                # Position body so left arm is VERY CLOSE to its first anchor point
+                # Position body so left arm is close to its first anchor point
                 wp1 = np.array(self.current_path[0].position)
                 
                 # LEFT ARM anchor is wp1 (e.g., (1.00, 1.65, 1.40) on front wall)
-                # Left arm base is at body_x - 0.25
-                # We want the left gripper to START almost at the anchor point
-                # With arm fully extended forward (~1.0m), body should be ~1.0m behind anchor
-                # But we want gripper CLOSE to anchor, so position body closer
+                # With side-mounted arms: Left arm base is at body_y - 0.15 (front side)
+                # Position body so arm only needs to reach ~0.5m to anchor
                 
-                # Place body so left arm only needs to reach ~0.3m to anchor
-                body_x = wp1[0] + 0.25         # Body X so arm base is at anchor X
-                body_y = wp1[1] - 0.5          # Only 50cm behind anchor (very close)
+                body_x = wp1[0]                # Body X aligned with anchor X
+                body_y = wp1[1] - 0.5          # 50cm behind anchor (very close)
                 body_z = 1.0                   # Middle height (works for both ceiling and floor paths)
                 
                 # STRICT clamping to ensure ENTIRE robot is inside module
@@ -1726,10 +1741,10 @@ class WallCrawlerMuJoCoSimulation:
                 self.data.qpos[1] = body_y
                 self.data.qpos[2] = body_z
                 
-                print(f"\n📍 WALL-CRAWLER LOCOMOTION TEST")
+                print(f"\n📍 WALL-CRAWLER LOCOMOTION TEST (Side-mounted arms)")
                 print(f"  First anchor (WP1): ({wp1[0]:.2f}, {wp1[1]:.2f}, {wp1[2]:.2f})")
                 print(f"  Body position: ({body_x:.2f}, {body_y:.2f}, {body_z:.2f})")
-                print(f"  Left arm base at X: {body_x - 0.25:.2f} (offset -0.25 from body)")
+                print(f"  Left arm base at Y: {body_y + LEFT_ARM_OFFSET:.2f} (offset {LEFT_ARM_OFFSET} from body)")
                 print(f"  Distance to anchor: Y={wp1[1] - body_y:.2f}m, Z={wp1[2] - body_z:.2f}m")
             elif self.start_position:
                 anchor_x, anchor_y, anchor_z = self.start_position
