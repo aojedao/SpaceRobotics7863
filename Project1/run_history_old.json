@@ -370,8 +370,22 @@
       "waypoints_reached": 4,
       "total_waypoints": 4,
       "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-04T23:01:10.504557",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 7,
+      "reason": "stopped at WP2"
+    },
+    {
+      "timestamp": "2025-12-04T23:31:57.172474",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 7,
+      "reason": "stopped at WP1"
     }
   ],
-  "total": 53,
+  "total": 55,
   "successes": 29
 }

@@ -231,11 +231,11 @@ class ArmController:
         body_pos = self.get_central_body_pos()
         body_quat = self.data.qpos[3:7]
         
-        # Arms mounted on Y-axis sides (front/back of central body)
+        # Arms mounted on X-axis ends (left/right of central body), pointing upward
         if arm == 'left':
-            arm_base_offset = np.array([0, -0.15, 0])  # Left arm on front side (-Y)
+            arm_base_offset = np.array([-0.25, 0, 0])  # Left arm on left end (-X)
         else:
-            arm_base_offset = np.array([0, 0.15, 0])   # Right arm on back side (+Y)
+            arm_base_offset = np.array([0.25, 0, 0])   # Right arm on right end (+X)
         
         arm_base = body_pos + arm_base_offset
         to_target = target_pos - arm_base
