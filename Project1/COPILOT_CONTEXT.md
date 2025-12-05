@@ -4,7 +4,7 @@
 Dual-arm wall-crawler robot simulation for ISS module traversal using MuJoCo physics engine.
 The robot alternates between two KUKA iiwa14 arms with Robotiq 2F85 grippers to traverse walls.
 
-## Current State (December 3, 2025)
+## Current State (December 4, 2025) - Branch: DualArmDev-forced-acceptance
 
 ### ⚠️ CRITICAL ISSUE - FORCED ACCEPTANCE IS FAKE COMPLETION
 
@@ -21,7 +21,15 @@ The current "forced acceptance" mechanism is a WORKAROUND, not a real solution:
 1. Robot may be 50cm+ away from where it should be anchored
 2. Subsequent waypoints become harder to reach (error compounds)
 3. The screw task at the end happens at wrong location
-4. Success metrics are misleading - "60% success" doesn't mean 60% correct trajectories
+4. Success metrics are misleading - "100% success" doesn't mean 100% correct trajectories
+
+### Latest Test Results (10 runs on Dec 4, 2025)
+```
+Success Rate: 10/10 (100%) - BUT WITH FORCED ACCEPTANCES
+Runs needing recovery: 7/10 (70%)
+Total forced acceptances: 9
+Average forced acceptance error: ~0.45m (range: 0.33m - 0.60m)
+```
 
 ### Current Forced Acceptance Thresholds (THESE ARE TOO LENIENT)
 ```python
