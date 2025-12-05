@@ -2267,14 +2267,23 @@ class WallCrawlerMuJoCoSimulation:
                                 in_recovery_mode = True
                                 recovery_start_time = current_time
                                 
-                                # Get current joint1 angle and set target to 180° away
+                                # Get current joint1 angle and compute optimal target
                                 if moving_arm == 'left':
                                     current_j1 = self.data.qpos[self.left_arm_qpos_slice][0]
                                 else:
                                     current_j1 = self.data.qpos[self.right_arm_qpos_slice][0]
                                 
-                                # Rotate by 180 degrees (π radians)
-                                recovery_joint1_target = current_j1 + np.pi
+                                # IMPROVED RECOVERY: Use compute_first_joint_target on odd attempts
+                                # On even attempts, use 180° rotation as fallback
+                                if recovery_attempts % 2 == 1:
+                                    # Use intelligent targeting
+                                    recovery_joint1_target = self.compute_first_joint_target(moving_arm, np.array(current_target), relaxed_limits=True)
+                                    recovery_strategy = "optimal J1"
+                                else:
+                                    # Fallback: Rotate by 180 degrees
+                                    recovery_joint1_target = current_j1 + np.pi
+                                    recovery_strategy = "180° rotation"
+                                
                                 # Normalize to [-pi, pi]
                                 while recovery_joint1_target > np.pi:
                                     recovery_joint1_target -= 2 * np.pi
@@ -2284,17 +2293,13 @@ class WallCrawlerMuJoCoSimulation:
                                 print(f"\n⚠️ STUCK DETECTED after {time_without_progress:.1f}s without progress")
                                 print(f"  Current error: {error:.3f}m | Best seen: {best_error:.3f}m")
                                 print(f"  Starting RECOVERY {recovery_attempts}/{max_recovery_attempts}:")
-                                print(f"    - Rotating {moving_arm.upper()} arm J1 by 180°")
+                                print(f"    - {moving_arm.upper()} arm J1: {recovery_strategy}")
                                 print(f"    - J1: {np.degrees(current_j1):.1f}° → {np.degrees(recovery_joint1_target):.1f}°")
                             else:
                                 print(f"\n❌ MAX RECOVERY ATTEMPTS ({max_recovery_attempts}) REACHED")
-                                print(f"  Forcing progression to next waypoint...")
-                                # Force accept current position and move to next waypoint
-                                if error < 0.60:  # If within 60cm, force accept
-                                    print(f"  ⚡ FORCE ACCEPTING with error: {error:.3f}m")
-                                    should_force_accept = True
-                                else:
-                                    print(f"  ❌ Error too large ({error:.3f}m) - skipping waypoint")
+                                print(f"  Continuing to try (no force acceptance)")
+                                # DON'T force accept - keep trying indefinitely
+                                # Reset recovery attempts to allow more tries
                                 recovery_attempts = 0
                                 last_progress_time = current_time
                                 last_best_error = float('inf')
@@ -2312,36 +2317,17 @@ class WallCrawlerMuJoCoSimulation:
                         print(f"  [{phase_timer:4d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){suffix}")
                     
                     # Success - reached waypoint (must be close to target sphere)
-                    # Use generous thresholds to ensure completion
+                    # Use STRICT thresholds - no fake reaching allowed
                     is_final_waypoint = current_waypoint_idx == total_waypoints - 1
-                    success_threshold = 0.15 if is_final_waypoint else 0.20  # 15cm for final, 20cm for intermediate
+                    success_threshold = 0.08 if is_final_waypoint else 0.15  # 8cm for final, 15cm for intermediate
                     
-                    # FORCED PROGRESSION: If stuck for too long with reasonable error, accept it
-                    # This ensures we always complete the trajectory
-                    forced_accept_threshold = 0.50  # Accept if we're within 50cm and stuck
-                    forced_accept_time = 3000  # ~6 seconds at 500Hz (reduced for faster iteration)
+                    # NO FORCED ACCEPTANCE - Only genuine reaching counts
                     
                     should_accept = error < success_threshold
                     
-                    # Check for force accept from max recovery
-                    if 'should_force_accept' in dir() and should_force_accept:
-                        should_accept = True
-                        should_force_accept = False
                     
-                    # Force acceptance if stuck with reasonable error
-                    if not should_accept and phase_timer > forced_accept_time and error < forced_accept_threshold:
-                        should_accept = True
-                        print(f"\n⚡ FORCED ACCEPTANCE after {phase_timer} steps (error: {error:.3f}m < {forced_accept_threshold}m)")
                     
-                    # Even more lenient: if recovery failed multiple times, accept larger error
-                    if not should_accept and recovery_attempts >= 2 and error < 0.60:
-                        should_accept = True
-                        print(f"\n⚡ RECOVERY FORCED ACCEPTANCE (error: {error:.3f}m, {recovery_attempts} recoveries attempted)")
                     
-                    # Ultra-lenient: if phase_timer is very high, accept anything within 70cm
-                    if not should_accept and phase_timer > 6000 and error < 0.70:
-                        should_accept = True
-                        print(f"\n⚡ TIMEOUT FORCED ACCEPTANCE (error: {error:.3f}m, {phase_timer} steps)")
                     
                     if should_accept:
                         print(f"\n✅ WP{current_waypoint_idx+1} REACHED by {moving_arm.upper()} arm! Error: {error:.3f}m")
