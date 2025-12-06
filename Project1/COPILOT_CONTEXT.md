@@ -1,244 +1,118 @@
-# Wall Crawler MuJoCo Simulation - Copilot Context# Wall Crawler MuJoCo Simulation - Copilot Context
+# Wall Crawler MuJoCo Simulation - Copilot Context
 
+## Project Overview
 
+Dual-arm wall-crawler robot simulation for ISS module traversal using MuJoCo physics engine.
+The robot alternates between two KUKA iiwa14 arms with Robotiq 2F85 grippers to traverse walls.
 
-## Project Overview## Project Overview
+## Current State (December 6, 2025)
 
-Dual-arm wall-crawler robot simulation for ISS module traversal using MuJoCo physics engine.Dual-arm wall-crawler robot simulation for ISS module traversal using MuJoCo physics engine.
+### Branch: `DualArmDev-side-mounted-arms_antigravity`
 
-The robot alternates between two KUKA iiwa14 arms with Robotiq 2F85 grippers to traverse walls.The robot alternates between two KUKA iiwa14 arms with Robotiq 2F85 grippers to traverse walls.
+### Arm Configuration (UPDATED)
+- **Left Arm**: Position Y=-0.25, Euler "0 -90 0" → Points in **-X direction**
+- **Right Arm**: Position Y=+0.25, Euler "0 90 0" → Points in **+X direction**
+- Arms are on the Y-axis sides of the body box, pointing outward in opposite X directions
+- Zero gravity environment (anti-gravity mode)
 
+### Test Results
+**Current Success Rate: 2.4% (2/84 runs)**
+- Most failures occur at early waypoints (WP1-WP3)
+- Best recent run: 12/13 waypoints reached
+- 2 complete successes recorded
 
+### Key Parameters
 
-## Current State (December 4, 2025)## Current State (December 3, 2025)
-
-
-
-### Test Results### ⚠️ CRITICAL ISSUE - FORCED ACCEPTANCE IS FAKE COMPLETION
-
-**Latest Run: 30% Success Rate (3/10 complete trajectories)**
-
-- Run 2: 4/4 WP complete, 0 recoveries**User Feedback:** "What is forced acceptance? It seems to fake completing a trajectory but it doesn't."
-
-- Run 5: 7/7 WP complete, 1 recovery  
-
-- Run 6: 9/9 WP complete, 2 recoveries**Problem Explanation:**
-
-- 7 runs timed out at later waypoints (WP5-8)The current "forced acceptance" mechanism is a WORKAROUND, not a real solution:
-
-- 25 recovery triggers total across all runs- When the robot gets stuck and can't reach a waypoint within the threshold (e.g., 15-20cm)
-
-- After a timeout, it "accepts" the position even if error is up to 50-70cm away
-
-### ✅ FORCED ACCEPTANCE REMOVED- This marks the waypoint as "complete" but the robot ISN'T actually at the waypoint
-
-- **No more fake completions** - waypoints must be reached within 0.15m threshold- The trajectory "completes" on paper but the robot hasn't actually traversed the path correctly
-
-- Robot either reaches waypoint correctly OR triggers recovery mechanism
-
-- All force acceptance code has been removed (was at 0.50-0.70m thresholds)**Why This Is Bad:**
-
-1. Robot may be 50cm+ away from where it should be anchored
-
-### Recovery Mechanism (Working)2. Subsequent waypoints become harder to reach (error compounds)
-
-When robot gets stuck (20s timeout, error > 0.12m):3. The screw task at the end happens at wrong location
-
-1. Triggers recovery mode (max 5 attempts, 3.0s duration each)4. Success metrics are misleading - "60% success" doesn't mean 60% correct trajectories
-
-2. **Odd attempts**: Use `compute_first_joint_target()` for optimal J1 rotation
-
-3. **Even attempts**: Rotate J1 by 180° ### Current Forced Acceptance Thresholds (THESE ARE TOO LENIENT)
-
-4. Skip anchor force during recovery to allow body repositioning```python
-
-5. Skip moving arm control during recoverysuccess_threshold = 0.15 if is_final else 0.20  # Normal acceptance (15-20cm)
-
-6. If recovery succeeds (error < 0.12m), resume normal operationforced_accept_threshold = 0.50  # Accepts at 50cm if stuck
-
-# After 2+ recovery attempts: accepts at 60cm
-
-### Controller Configuration# After 6000+ steps: accepts at 70cm (!)
-
-```
-
-#### Per-Joint Diagonal Gain Matrix (Higher for base joints)
-
-```python### 180° Recovery Strategy (Implemented but Not Enough)
-
-kp_joint_gains = [1400, 1200, 1000, 800, 600, 500, 400]  # J1 to J7- When stuck, rotates first joint by 180° to escape local minima
-
-```- Sometimes helps, but often robot still can't reach the target
-
-- The IK solver itself may have fundamental issues
-
-#### Joint Limit Avoidance (Weak, prevents singularities)
-
-```python### What Actually Needs To Be Fixed
-
-kp_limit = 50.0  # Weak push away from limits
-
-margin = 0.2  # radians (~11°) from joint limits1. **The IK Controller Itself** - May be stuck in singularities or local minima
-
-```   - Consider using a different IK approach (e.g., CCD, FABRIK)
-
-   - Add null-space optimization to escape singularities
-
-#### Arm Avoidance (Prevents collisions between arms)   - Implement proper singularity detection and avoidance
-
+#### Arm Offsets (in wall_crawler_mujoco.py)
 ```python
-
-arm_avoidance_threshold = 0.40  # meters2. **Path Planning** - Some waypoints may be unreachable
-
-arm_avoidance_strength = 1200.0   - The A* planner uses effective_reach = 0.75m but actual IK fails
-
-critical_arm_distance = 0.20  # meters   - Need to validate reachability BEFORE accepting a path
-
-```   - Consider workspace analysis to prune unreachable positions
-
-
-
-### Success Thresholds (STRICT - No Forced Acceptance)3. **Remove Forced Acceptance** - It masks the real problem
-
-```python   - Either reach the waypoint properly OR fail honestly
-
-success_threshold = 0.08  # Final waypoint   - Don't fake success with 50cm+ errors
-
-intermediate_threshold = 0.15  # Intermediate waypoints (USER APPROVED)
-
-```### What's Implemented (Partially Working)
-
-
-
-### Key Files1. **Random Goal Generation**: Goals randomly selected from 5 walls
-
-2. **Complete Route Visualization**: Color-coded waypoints
-
-#### wall_crawler_mujoco.py (~3107 lines)3. **Trajectory Error Plotting**: Non-blocking with 3-second timeout
-
-Main simulation file with dual KUKA iiwa14 arms.4. **180° Recovery**: Rotates joint1 when stuck (helps sometimes)
-
-5. **Per-Joint Gain Scaling**: [2.0, 1.8, 1.2, 1.0, 1.0, 0.8, 0.6]
-
-Key code locations:
-
-- **Lines 509-527**: Controller gains with diagonal matrix### Technical Configuration
-
-- **Lines 1088-1100**: Joint limit avoidance implementation
-
-- **Lines 2136-2150**: Anchor force skipped during recovery#### IK Controller Gains
-
-- **Lines 2166-2190**: Moving arm control skipped during recovery```python
-
-- **Lines 2202-2248**: Recovery mechanism with J1 rotationkp_position = 400.0          # Position gain
-
-- **Lines 2265-2300**: Stuck detection and recovery triggeringkd_position = 18.0           # Damping gain  
-
-lambda_dls = 0.012           # Damped least squares regularization
-
-#### dual_arm_robot.xmljoint_gain_scale = [2.0, 1.8, 1.2, 1.0, 1.0, 0.8, 0.6]
-
-MuJoCo model with two KUKA iiwa14 arms + Robotiq 2F85 grippers.```
-
-
-
-#### run_history.json#### Current (Broken) Success Thresholds
-
-Tracks all test runs (40+ runs, ~24 historical successes).```python
-
-success_threshold = 0.15-0.20  # What it SHOULD be
-
-### Technical Specificationsforced_accept_threshold = 0.50-0.70  # What it ACTUALLY accepts (BAD)
-
+LEFT_ARM_OFFSET = -0.25   # Y-axis offset for left arm
+RIGHT_ARM_OFFSET = 0.25   # Y-axis offset for right arm
 ```
 
-#### Robot Configuration
-
-- **Arms**: 2x KUKA iiwa14 (7-DOF each)### Key Files
-
-- **Grippers**: 2x Robotiq 2F85
-
-- **Joint limits**: #### wall_crawler_mujoco.py (~3122 lines)
-
-  - J1, J3, J5: ±170° (±2.967 rad)- Lines 2315-2375: Forced acceptance logic (NEEDS REMOVAL/FIX)
-
-  - J2, J4, J6: ±120° (±2.094 rad)  - `apply_arm_control()`: Per-joint gain scaling
-
-  - J7: ±175° (±3.054 rad)- `_render_visualization_geoms()`: Route visualization
-
-
-
-#### MuJoCo Settings#### dual_arm_robot.xml
-
-- **Timestep**: 0.002 seconds- Two KUKA iiwa14 arms + Robotiq 2F85 grippers
-
-- **Gravity**: Zero (space simulation)- Screw body (hidden until spawned)
-
-- **Integrator**: implicitfast
-
-### Running the Simulation
-
-### Running the Simulation```bash
-
-```bashcd /home/aojedao/Documents/NYU/SpaceRobotics/SpaceRobotics7863/Project1
-
-cd /home/user/Documents/NYU/SpaceRobotics/SpaceRobotics7863/Project1conda activate space-robotics 
-
-conda activate space-robotics python wall_crawler_mujoco.py
-
-python wall_crawler_mujoco.py```
-
+#### Control Gains
+```python
+kp_position = 450.0      # Position control gain (INCREASED)
+kd_position = 35.0       # Velocity damping (INCREASED)
+kp_orientation = 50.0    # Orientation control
+kd_orientation = 20.0
+lambda_dls = 0.008       # Damped least squares regularization
 ```
 
-### TODO - Priority Fixes Needed
+#### Path Planner
+```python
+step_size = 0.5m         # Distance between waypoints
+effective_reach = 0.75m  # Planning reach (< actual 1.25m arm reach)
+```
 
-### Known Issues / TODO
+### Recovery Mechanism
+- **15 recovery strategies** with varied J1 angles: [0.0, -1.0, 1.0, -2.0, 2.0, -1.5, 1.5, -2.5, 2.5, 0.5, -0.5, -3.0, 3.0, π/2, -π/2]
+- **Stuck threshold**: 8 seconds
+- **Recovery duration**: 3 seconds per attempt
+- **Smart J1 pre-rotation**: Initial joint 1 angle set toward target direction
 
-1. **REMOVE forced acceptance** - Stop faking success
+### Path Planning Logic
+1. **Initial arm selection**: Based on direction to goal
+   - Moving -X → LEFT arm starts (points -X)
+   - Moving +X → RIGHT arm starts (points +X)
+2. **Arm alternation**: Simple alternating LEFT/RIGHT for bipedal locomotion
+3. **No arm reachability filter**: Removed to allow direct paths; IK handles reachability at execution
 
-1. **Timeout at Later Waypoints** - 70% of runs time out at WP5-82. **Fix the IK solver** - Address why it gets stuck
-
-   - Recovery works but robot may still struggle to reach target3. **Validate path reachability** - Don't plan unreachable paths
-
-   - Consider: Better path planning, workspace validation4. **Honest failure reporting** - If it can't reach, say so
-
-
-
-2. **Recovery Strategy** - Alternating optimal J1 / 180° helps but not always sufficient### ISS Module Bounds
-
-   - Consider: More diverse recovery strategies```python
-
+### ISS Module Bounds
+```python
 ISS_MODULE = {
-
-3. **IK Solver Local Minima** - Robot sometimes gets stuck in poor configurations    'x_min': -2.1, 'x_max': 3.9,  # 6m length
-
-   - Consider: Null-space optimization, singularity detection    'y_min': -0.5, 'y_max': 1.7,  # 2.2m width  
-
-    'z_min': 0.1,  'z_max': 2.2   # 2.1m height
-
-### Repository Organization}
-
+    'x_min': -2.1, 'x_max': 3.9,
+    'y_min': -0.5, 'y_max': 1.7,
+    'z_min': 0.1,  'z_max': 2.2
+}
 ```
 
-#### Active Files (Project1/)
-- `wall_crawler_mujoco.py` - Main simulation
-- `dual_arm_robot.xml` - MuJoCo model
-- `run_history.json` - Test run tracking
-- `COPILOT_CONTEXT.md` - This file
+## Files Overview
 
-#### Archived Files (Project1/archive/)
-- `brachiation/` - Old brachiation experiments
-- `old_simulators/` - Previous simulation versions
-- `old_scripts/` - Utility scripts no longer used
-- `old_configs/` - Old MuJoCo configurations
-- `old_tests/` - Deprecated test files
+| File | Purpose |
+|------|---------|
+| `wall_crawler_mujoco.py` | Main simulation (~3400 lines) with path planning, IK control, locomotion |
+| `dual_arm_robot.xml` | MuJoCo model with robot and ISS environment |
+| `run_multiple_tests.py` | Batch test runner (parallel or sequential) |
+| `run_history.json` | Test results history |
 
-### Performance Tracking
+## Command Line Usage
 
-| Metric | Value |
-|--------|-------|
-| Latest Success Rate | 30% (3/10) |
-| Historical Success | 60% (24/40+) |
-| Recovery Triggers | 25 in 10 runs |
-| Avg Waypoints | 6-7 per run |
-| Main Failure | Timeout at WP5-8 |
+```bash
+# Run with visualization (default)
+conda run -n space-robotics python wall_crawler_mujoco.py
+
+# Run headless (basic - needs full locomotion loop)
+conda run -n space-robotics python wall_crawler_mujoco.py --headless
+
+# Run without recording to history
+conda run -n space-robotics python wall_crawler_mujoco.py --no-record
+
+# Run multiple tests with visualization (sequential)
+conda run -n space-robotics python run_multiple_tests.py 5 1 --visualize
+```
+
+## Known Issues
+
+1. **Low Success Rate (2.4%)**: IK solver gets stuck in local minima
+2. **Arm Crossing**: When arms cross paths, recovery is difficult
+3. **Headless Mode Incomplete**: `run_headless()` doesn't run full locomotion loop
+4. **Early Waypoint Failures**: Most failures at WP1-WP3 suggest body positioning issues
+
+## TODO
+
+1. [ ] Extract locomotion loop from `run_visualization()` into reusable method
+2. [ ] Implement full headless mode with complete locomotion logic
+3. [ ] Improve IK convergence with null-space optimization
+4. [ ] Better initial body positioning based on first waypoint
+5. [ ] Achieve 70% success rate target
+
+## Recent Changes (December 6, 2025)
+
+1. ✅ Repositioned arms to Y-axis sides pointing ±X
+2. ✅ Updated ARM_OFFSET constants to match new positions
+3. ✅ Removed restrictive arm reachability filter from path planner
+4. ✅ Added initial arm selection based on travel direction
+5. ✅ Increased control gains (kp=450, kd=35)
+6. ✅ Expanded recovery strategies to 15 different J1 angles
+7. ✅ Added --headless flag (basic implementation)
+8. ✅ Smart J1 pre-rotation toward target direction
