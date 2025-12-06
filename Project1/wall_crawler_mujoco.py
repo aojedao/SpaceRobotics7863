@@ -74,12 +74,12 @@ ISS_WIDTH = ISS_MODULE['x_max'] - ISS_MODULE['x_min']   # 6.0m
 ISS_DEPTH = ISS_MODULE['y_max'] - ISS_MODULE['y_min']   # 2.2m (was 2.4m)
 ISS_HEIGHT = ISS_MODULE['z_max'] - ISS_MODULE['z_min']  # 2.3m (was 2.2m)
 
-# DUAL ARM CONFIGURATION - Side-mounted arms on Y-axis, pointing outward in X
-# Left arm on left side (Y=-0.25), pointing outward (-X direction)
-# Right arm on right side (Y=+0.25), pointing outward (+X direction)
-LEFT_ARM_OFFSET = -0.15   # Y offset from central body (left side)
-RIGHT_ARM_OFFSET = 0.15   # Y offset from central body (right side)
-ARM_SEPARATION = 0.30     # 0.3m between arms (Y direction)
+# DUAL ARM CONFIGURATION - End-mounted arms on X-axis, pointing outward
+# Left arm on left end (X=-0.2), pointing outward (-X direction)
+# Right arm on right end (X=+0.2), pointing outward (+X direction)
+LEFT_ARM_OFFSET = -0.30   # X offset from central body (left end, matches XML)
+RIGHT_ARM_OFFSET = 0.05   # X offset from central body (right end, matches XML)
+ARM_SEPARATION = 0.40     # 0.4m between arms (X direction)
 
 # KUKA iiwa14 workspace
 KUKA_REACH = 1.25  # meters (including gripper)
@@ -157,7 +157,7 @@ class WallPositionMapper:
     Maps discrete positions on the ISS module walls where the robot can grip.
     """
     
-    def __init__(self, step_size: float = 0.4, arm_reach: float = KUKA_REACH):
+    def __init__(self, step_size: float = 0.6, arm_reach: float = KUKA_REACH):
         self.step_size = step_size
         self.arm_reach = arm_reach
         # Effective reach for path planning - REDUCED to prevent over-stretching
@@ -439,9 +439,10 @@ class WallCrawlerMuJoCoSimulation:
         self.data = mujoco.MjData(self.model)
         print("✓ Model loaded successfully!")
         
-        # Initialize wall position mapper with SMALLER step size to reduce arm crossing
-        # Smaller steps = more waypoints = less stretching = less crossing
-        self.wall_mapper = WallPositionMapper(step_size=0.35, arm_reach=KUKA_REACH)
+        # Initialize wall position mapper with step size for route generation
+        # step_size must be <= effective_reach (0.75m) for path planning to work
+        # Using 0.5m for shorter steps = more waypoints but easier arm reach
+        self.wall_mapper = WallPositionMapper(step_size=0.5, arm_reach=KUKA_REACH)
         
         # Initialize path planner
         self.path_planner = PathPlanner(self.wall_mapper)
@@ -522,8 +523,8 @@ class WallCrawlerMuJoCoSimulation:
         self.right_arm_qvel_slice = slice(21, 28)
         
         # Controller gains - Balanced for smooth yet effective motion
-        self.kp_position = 400.0      # Position control (increased for reliability)
-        self.kd_position = 18.0       # Damping (good balance of speed and stability)
+        self.kp_position = 300.0      # Position control (moderate for smooth motion)
+        self.kd_position = 25.0       # Damping (higher for less oscillation)
         self.kp_orientation = 30.0    # Orientation control
         self.kd_orientation = 15.0
         self.lambda_dls = 0.012       # Damping for DLS (lower for better tracking)
@@ -818,19 +819,18 @@ class WallCrawlerMuJoCoSimulation:
         left_rel = left_grip - body_pos
         right_rel = right_grip - body_pos
         
-        # Local X coordinates (negative = left side, positive = right side)
+        # Local X coordinates (negative = left side/back, positive = right side/front)
         left_local_x = left_rel[0] * cos_yaw - left_rel[1] * sin_yaw
         right_local_x = right_rel[0] * cos_yaw - right_rel[1] * sin_yaw
         
-        # Local Y coordinates for diagnostics
-        left_local_y = left_rel[0] * sin_yaw + left_rel[1] * cos_yaw
-        right_local_y = right_rel[0] * sin_yaw + right_rel[1] * cos_yaw
+        # Check for crossing (X-axis based for X-mounted arms):
+        # Left arm base is at X=-0.3, should stay on -X side (or not cross too far +X)
+        # Right arm base is at X=+0.3, should stay on +X side (or not cross too far -X)
         
-        # Check for crossing (Y-axis based for Y-mounted arms):
-        # Left arm base is at Y=-0.15, should stay on -Y side (or not cross too far +Y)
-        # Right arm base is at Y=+0.15, should stay on +Y side (or not cross too far -Y)
-        left_on_wrong_side = left_local_y > 0.1   # Left gripper crosses to positive Y
-        right_on_wrong_side = right_local_y < -0.1  # Right gripper crosses to negative Y
+        # Left gripper shouldn't cross too far to positive X
+        left_on_wrong_side = left_local_x > 0.1
+        # Right gripper shouldn't cross too far to negative X
+        right_on_wrong_side = right_local_x < -0.1
         
         # Also check if grippers are dangerously close (collision risk)
         gripper_distance = np.linalg.norm(left_grip - right_grip)
@@ -843,8 +843,8 @@ class WallCrawlerMuJoCoSimulation:
         severity = 0.0
         if left_on_wrong_side and right_on_wrong_side:
             # Both arms on wrong side - real crossing
-            severity += min((left_local_y - 0.05) / 0.4, 0.5)
-            severity += min((-right_local_y - 0.05) / 0.4, 0.5)
+            severity += min((left_local_x - 0.1) / 0.4, 0.5)
+            severity += min((-right_local_x - 0.1) / 0.4, 0.5)
         if grippers_too_close:
             severity += (0.15 - gripper_distance) / 0.15  # Closer = worse
         
@@ -862,12 +862,12 @@ class WallCrawlerMuJoCoSimulation:
                 print(f"  ║ Body Yaw: {np.degrees(body_yaw):.1f}°")
                 print(f"  ╟──────────────────────────────────────────────────────────╢")
                 print(f"  ║ LEFT Gripper (world):  ({left_grip[0]:.3f}, {left_grip[1]:.3f}, {left_grip[2]:.3f})")
-                print(f"  ║ LEFT Gripper (local):  X={left_local_x:+.3f}, Y={left_local_y:+.3f}")
-                print(f"  ║   → Should be Y < -0.2 (front) | {'❌ ON WRONG SIDE' if left_on_wrong_side else '✓ OK'}")
+                print(f"  ║ LEFT Gripper (local):  X={left_local_x:+.3f}, Y={left_rel[0] * sin_yaw + left_rel[1] * cos_yaw:+.3f}")
+                print(f"  ║   → Should be X < 0.1 (left side) | {'❌ ON WRONG SIDE' if left_on_wrong_side else '✓ OK'}")
                 print(f"  ╟──────────────────────────────────────────────────────────╢")
                 print(f"  ║ RIGHT Gripper (world): ({right_grip[0]:.3f}, {right_grip[1]:.3f}, {right_grip[2]:.3f})")
-                print(f"  ║ RIGHT Gripper (local): X={right_local_x:+.3f}, Y={right_local_y:+.3f}")
-                print(f"  ║   → Should be Y > +0.2 (back)  | {'❌ ON WRONG SIDE' if right_on_wrong_side else '✓ OK'}")
+                print(f"  ║ RIGHT Gripper (local): X={right_local_x:+.3f}, Y={right_rel[0] * sin_yaw + right_rel[1] * cos_yaw:+.3f}")
+                print(f"  ║   → Should be X > -0.1 (right side) | {'❌ ON WRONG SIDE' if right_on_wrong_side else '✓ OK'}")
                 print(f"  ╟──────────────────────────────────────────────────────────╢")
                 print(f"  ║ Gripper Distance: {gripper_distance:.3f}m {'⚠️ TOO CLOSE' if grippers_too_close else ''}")
                 print(f"  ║ Crossing Severity: {severity:.2f} / 1.00")
@@ -904,60 +904,19 @@ class WallCrawlerMuJoCoSimulation:
         body_pos = self.get_central_body_pos()
         body_quat = self.data.qpos[3:7]
         
-        # Get arm base position (offset from body) - arms mounted on Y-axis ends
+        # Get arm base position (offset from body) - arms mounted on X-axis ends
         if arm == 'left':
-            arm_base_offset = np.array([0, LEFT_ARM_OFFSET, 0])  # Left arm is -Y from body
+            arm_base_offset = np.array([LEFT_ARM_OFFSET, 0, 0])  # Left arm is -X from body
         else:
-            arm_base_offset = np.array([0, RIGHT_ARM_OFFSET, 0])  # Right arm is +Y from body
+            arm_base_offset = np.array([RIGHT_ARM_OFFSET, 0, 0])  # Right arm is +X from body
         
         # Arm base in world coordinates (simplified - assume body aligned with world)
         arm_base = body_pos + arm_base_offset
-        
-        # Vector from arm base to target (in XY plane)
-        to_target = target_pos - arm_base
-        to_target_xy = np.array([to_target[0], to_target[1]])
-        
-        if np.linalg.norm(to_target_xy) < 0.1:
-            return 0.0  # Target is directly above/below
-        
-        # Angle in world XY plane
-        world_angle = np.arctan2(to_target_xy[1], to_target_xy[0])
-        
-        # Get body yaw to compute relative angle
-        w, x, y, z = body_quat
-        body_yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
-        
-        # First joint angle relative to body
-        # The arm's first joint rotates around body's local Z axis
-        joint1_angle = world_angle - body_yaw
-        
-        # Normalize to [-π, π]
-        while joint1_angle > np.pi:
-            joint1_angle -= 2*np.pi
-        while joint1_angle < -np.pi:
-            joint1_angle += 2*np.pi
-        
-        # Set limits based on mode - STRICT to prevent crossing
-        if relaxed_limits:
-            max_limit = np.pi * 0.6   # Allow up to 108 degrees
-        else:
-            max_limit = np.pi * 0.4   # Only 72 degrees - keep arms on their sides
-        
-        # STRICT constraints: Keep arms on their designated sides
-        # Left arm: should be in range [-π, +max_limit] (mostly left side)
-        # Right arm: should be in range [-max_limit, +π] (mostly right side)
-        if arm == 'left':
-            # Left arm: limit how far it can go to the RIGHT (positive angles)
-            if joint1_angle > max_limit:
-                joint1_angle = max_limit
-            # Allow left arm to go far left (negative angles) freely
-        else:
-            # Right arm: limit how far it can go to the LEFT (negative angles)
-            if joint1_angle < -max_limit:
-                joint1_angle = -max_limit
-            # Allow right arm to go far right (positive angles) freely
-        
-        return joint1_angle
+
+        # NOTE: With X-axis mounting, J1 rotates around the X-axis (roll).
+        # The previous logic calculated yaw in XY plane, which applies to Z-mounted arms.
+        # For now, we return 0.0 to let the IK solver determine the best angle.
+        return 0.0
     
     def compute_arm_control(self, arm: str = 'left') -> Tuple[np.ndarray, np.ndarray]:
         """Compute Cartesian space control for specified arm
@@ -1672,7 +1631,7 @@ class WallCrawlerMuJoCoSimulation:
         print("  🔴 Red sphere: Goal position")
         print("  🔵 Blue spheres: Upcoming waypoints")
         print("  🟡 Yellow sphere: Current target waypoint")
-        print("  � Orange sphere: Active arm target")
+        print("  🟠 Orange sphere: Active arm target")
         print("  ⎯⎯ Cyan lines: Planned route")
         print("  ⎯⎯ Green lines: Completed route segments")
         print(f"  🔵 Blue transparent sphere: Left arm workspace ({WORKSPACE_SPHERE_RADIUS}m from elbow)")
@@ -1718,34 +1677,66 @@ class WallCrawlerMuJoCoSimulation:
             module_center_z = (ISS_MODULE['z_min'] + ISS_MODULE['z_max']) / 2  # 1.15
             
             if self.start_position and self.current_path and len(self.current_path) > 0:
-                # Position body so left arm can reach its first anchor point
+                # ================================================================
+                # SMART BASE PLACEMENT
+                # Position body so the active arm can easily reach the first anchor
+                # ================================================================
                 wp1 = np.array(self.current_path[0].position)
+                wp1_wall = self.current_path[0].wall
+                active_arm = self.current_path[0].active_arm
                 
-                # With arms on Y-sides pointing outward in ±X:
-                # - Left arm at Y=-0.25 points in -X direction
-                # - Right arm at Y=+0.25 points in +X direction
-                # Left arm has ~1.25m reach in -X direction
-                # So body should be +0.8m from target in X direction
+                # 1. Get Surface Normal (points INTO module)
+                surface_normal = self.get_surface_normal(wp1_wall)
                 
-                body_x = wp1[0] + 0.8          # Body +0.8m from anchor in X (left arm reaches -X)
-                body_y = wp1[1]                # Body Y aligned with anchor Y
-                body_z = wp1[2]                # Match anchor Z height
+                # 2. Determine ideal body position
+                # We want the body to be positioned such that:
+                # - The arm is not fully extended (avoid singularities)
+                # - The arm is not too compressed (avoid self-collision)
+                # - The body is "above" the surface (along the normal)
+                
+                ideal_reach = 0.85  # ideal distance from base to gripper (m)
+                
+                # Arm Base Offset from Body Center
+                if active_arm == 'left':
+                    arm_base_offset = np.array([LEFT_ARM_OFFSET, 0, 0])
+                else:
+                    arm_base_offset = np.array([RIGHT_ARM_OFFSET, 0, 0])
+                
+                # Body Position = Waypoint - ArmBaseOffset + (Normal * Reach)
+                # Use normal * reach to place body "above" the surface
+                body_pos = wp1 - arm_base_offset + (surface_normal * ideal_reach)
+                
+                body_x, body_y, body_z = body_pos
                 
                 # STRICT clamping to ensure ENTIRE robot is inside module
-                robot_radius = 0.4  # Conservative estimate of robot extent
-                body_x = np.clip(body_x, ISS_MODULE['x_min'] + robot_radius, ISS_MODULE['x_max'] - robot_radius)
-                body_y = np.clip(body_y, ISS_MODULE['y_min'] + robot_radius, ISS_MODULE['y_max'] - robot_radius)
-                body_z = np.clip(body_z, ISS_MODULE['z_min'] + robot_radius, ISS_MODULE['z_max'] - robot_radius)
+                # With X-axis mounting: Left Arm Base: BodyX - 0.3 | Right Arm Base: BodyX + 0.05
+                # We need ArmBase +/- Buffer to be inside [X_min, X_max]
+                
+                arm_buffer = 0.25  # VERY REDUCED Buffer to get body as close as possible to targets
+                
+                # Min Body X: LeftArmBase > X_min + Buffer => BodyX - 0.3 > X_min + Buffer
+                min_body_x = ISS_MODULE['x_min'] + arm_buffer + 0.3
+                
+                # Max Body X: RightArmBase < X_max - Buffer => BodyX + 0.05 < X_max - Buffer
+                max_body_x = ISS_MODULE['x_max'] - arm_buffer - 0.05
+                
+                # Standard padding for Y and Z (arms are on sides, so less critical)
+                safe_margin = 0.35
+                
+                body_x = np.clip(body_x, min_body_x, max_body_x)
+                body_y = np.clip(body_y, ISS_MODULE['y_min'] + safe_margin, ISS_MODULE['y_max'] - safe_margin)
+                body_z = np.clip(body_z, ISS_MODULE['z_min'] + safe_margin, ISS_MODULE['z_max'] - safe_margin)
                 
                 self.data.qpos[0] = body_x
                 self.data.qpos[1] = body_y
                 self.data.qpos[2] = body_z
                 
-                print(f"\n📍 WALL-CRAWLER LOCOMOTION TEST (Arms on Y-sides: Left→-X, Right→+X)")
+                print(f"\n📍 WALL-CRAWLER LOCOMOTION TEST (Arms on X-ends)")
+                print(f"  Start Wall: {wp1_wall}")
                 print(f"  First anchor (WP1): ({wp1[0]:.2f}, {wp1[1]:.2f}, {wp1[2]:.2f})")
                 print(f"  Body position: ({body_x:.2f}, {body_y:.2f}, {body_z:.2f})")
-                print(f"  Left arm at Y=-0.25, points: -X direction")
-                print(f"  Right arm at Y=+0.25, points: +X direction")
+                print(f"  Left arm at X=-0.2, points: -X direction")
+                print(f"  Right arm at X=+0.2, points: +X direction")
                 print(f"  Distance to WP1: {np.linalg.norm(wp1 - np.array([body_x, body_y, body_z])):.2f}m")
             elif self.start_position:
                 anchor_x, anchor_y, anchor_z = self.start_position
@@ -1760,17 +1751,48 @@ class WallCrawlerMuJoCoSimulation:
             self.data.qpos[3] = 1.0   # quat w
             self.data.qpos[4:7] = 0.0 # quat xyz
             
-            # LEFT ARM - Arm points -X by default (due to euler in XML)
-            # Start with arm extended toward -X to reach left wall targets
-            # Keep joints at 0 for default extended pose, arm naturally reaches -X
-            self.data.qpos[6] = 0.0      # joint0 - base rotation
-            self.data.qpos[7] = 0.0      # joint1
-            self.data.qpos[8] = 0.3      # joint2 - slight pitch 
-            self.data.qpos[9] = 0.0      # joint3
-            self.data.qpos[10] = 0.5     # joint4 - elbow bend
-            self.data.qpos[11] = 0.0     # joint5 
-            self.data.qpos[12] = 0.0     # joint6
-            self.data.qpos[13] = 0.0     # joint7
+            # Initialize ArmController for IK solving
+            print("  ⚙️ Solving IK for initial anchor...")
+            try:
+                # Create detailed configuration with high gains for solving
+                from arm_controller import ArmController, ArmControllerConfig
+                ik_config = ArmControllerConfig()
+                ik_config.kp_position = 20.0  # Normalized gain for iterative solve
+                ik_config.kd_position = 0.0   # No damping needed for static solve
+                
+                controller = ArmController(self.model, self.data, ik_config)
+                
+                # Set target for Left Arm (WP1)
+                controller.left_target_position = np.array(wp1)
+                
+                # Convergence Loop
+                for _ in range(150):
+                    # Compute control command
+                    joint_cmd, pos_error = controller.compute_arm_control('left')
+                    
+                    # Apply command directly to qpos (teleport integration)
+                    self.data.qpos[7:14] = joint_cmd
+                    
+                    # Update kinematics
+                    mujoco.mj_forward(self.model, self.data)
+                    
+                    if np.linalg.norm(pos_error) < 0.02:
+                        print(f"  ✓ IK Converged! Error: {np.linalg.norm(pos_error):.4f}m")
+                        break
+                        
+                # Ensure RIGHT ARM is tucked
+                self.data.qpos[25] = 1.5  # Joint 4 tucked
+                mujoco.mj_forward(self.model, self.data)
+                
+            except ImportError:
+                print("  ⚠️ ArmController not found, using default pose")
+                self.data.qpos[10] = 1.0  # Fallback manual bend
+            except Exception as e:
+                print(f"  ⚠️ IK failed: {e}")
+                self.data.qpos[10] = 1.0  # Fallback manual bend
+            
+            # Zero velocities
+            self.data.qvel[:] = 0.0
             
             # RIGHT ARM - Start TUCKED IN to avoid extending outside workspace
             # Right arm points +X by default, fold it toward body
@@ -1837,10 +1859,12 @@ class WallCrawlerMuJoCoSimulation:
             max_recovery_attempts = 5  # Reduced - we have a better strategy now
             in_recovery_mode = False
             recovery_start_time = 0
-            recovery_duration = 3.0  # Shorter recovery - just rotate and resume
+            recovery_duration = 4.0  # Increased to 4s for intelligent IK recovery (odd attempts)
             self._stuck_counter = 0  # Initialize stuck counter
             self._partial_release = False  # Initialize partial release flag
             recovery_joint1_target = None  # Target for joint1 during recovery
+            recovery_j1_velocity_gain = 4.0  # Increased from 3.0 for faster intelligent recovery
+            recovery_damping_factor = 0.95  # Reduced from 0.98 for more aggressive repositioning
             
             # Get all waypoints and walls from path
             waypoints = []
@@ -2055,18 +2079,43 @@ class WallCrawlerMuJoCoSimulation:
                                 # Blend toward locked position
                                 self.data.qpos[qpos_slice] = self.data.qpos[qpos_slice] + 0.1 * joint_error
                     
-                    # BODY PULL: Pull body toward anchor point (helps body follow arm)
+                    # BODY PULL: Pull body toward MIDPOINT between anchor and where moving arm needs to go
+                    # This helps position the body optimally for the next waypoint
                     body_pos = self.get_central_body_pos()
-                    body_to_anchor = anchor_pos - body_pos
-                    distance = np.linalg.norm(body_to_anchor)
                     
-                    if distance > 0.4:
-                        body_pull_stiffness = 100.0
-                        body_damping_coef = 40.0  # Higher damping for body
-                        body_vel = self.data.qvel[0:3]
+                    # Get the moving arm's target (if available)
+                    moving_target = None
+                    if arm == 'left' and hasattr(self, 'right_target_position') and self.right_target_position is not None:
+                        moving_target = self.right_target_position
+                    elif arm == 'right' and hasattr(self, 'left_target_position') and self.left_target_position is not None:
+                        moving_target = self.left_target_position
+                    
+                    if moving_target is not None:
+                        # Pull body toward the midpoint between anchor and moving target
+                        midpoint = (anchor_pos + moving_target) / 2.0
+                        body_to_mid = midpoint - body_pos
+                        distance = np.linalg.norm(body_to_mid)
                         
-                        body_force = body_pull_stiffness * body_to_anchor - body_damping_coef * body_vel
-                        self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                        # Moderate force for smooth body repositioning
+                        if distance > 0.10:
+                            body_pull_stiffness = 300.0  # Moderate force
+                            body_damping_coef = 40.0     # Good damping
+                            body_vel = self.data.qvel[0:3]
+                            
+                            body_force = body_pull_stiffness * body_to_mid - body_damping_coef * body_vel
+                            self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                    else:
+                        # Fall back to original anchor-only pull
+                        body_to_anchor = anchor_pos - body_pos
+                        distance = np.linalg.norm(body_to_anchor)
+                        
+                        if distance > 0.4:
+                            body_pull_stiffness = 200.0  # Increased from 100.0
+                            body_damping_coef = 30.0
+                            body_vel = self.data.qvel[0:3]
+                            
+                            body_force = body_pull_stiffness * body_to_anchor - body_damping_coef * body_vel
+                            self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
                     
                     # TRACK: Record deviation for anchor statistics
                     if current_anchor_idx is not None and current_anchor_idx in anchor_deviation_history:
@@ -2086,6 +2135,19 @@ class WallCrawlerMuJoCoSimulation:
                     
                     # Keep right arm retracted
                     self.data.ctrl[self.right_arm_actuator_slice] = self.data.qpos[self.right_arm_qpos_slice]
+                    
+                    # Move body toward first waypoint (before any anchor exists)
+                    # This helps the robot get into position for the first grab
+                    body_pos = self.get_central_body_pos()
+                    body_to_target = current_target - body_pos
+                    body_distance = np.linalg.norm(body_to_target)
+                    
+                    # Apply body force to move toward target - moderate for smooth motion
+                    body_vel = self.data.qvel[0:3]
+                    kp_body = 300.0  # INCREASED: More aggressive repositioning to reach first waypoint
+                    kd_body = 30.0   # Higher damping for stability
+                    body_force = kp_body * body_to_target - kd_body * body_vel
+                    self.data.xfrc_applied[self.central_body_id, 0:3] = body_force
                     
                     # Left arm reaches toward first waypoint
                     if current_target is not None:
@@ -2164,7 +2226,13 @@ class WallCrawlerMuJoCoSimulation:
                     phase_timer += 1
                     global_step += 1
                     
-                    # Apply anchor force to the anchored arm
+                    # First, set the moving arm's target so body pull knows where to go
+                    if moving_arm == 'left':
+                        self.left_target_position = current_target.copy()
+                    else:
+                        self.right_target_position = current_target.copy()
+                    
+                    # Apply anchor force to the anchored arm (now knows moving target for body pull)
                     if anchored_arm == 'left' and self.left_anchor_position is not None:
                         apply_anchor_force('left', self.left_anchor_position, '_prev_left_pos')
                         self.left_target_position = self.left_anchor_position.copy()
@@ -2179,7 +2247,7 @@ class WallCrawlerMuJoCoSimulation:
                     # Moving arm reaches toward target
                     # Also adjust first 5 joints of anchored arm to help body positioning
                     if moving_arm == 'left':
-                        self.left_target_position = current_target.copy()
+                        self.left_target_position = current_target.copy()  # Re-set after anchor overwrote
                         if use_orientation_control:
                             error = self.apply_arm_control_with_orientation('left', current_target_wall)
                         else:
@@ -2190,7 +2258,7 @@ class WallCrawlerMuJoCoSimulation:
                         if error > 0.15 and anchored_arm == 'right' and self.right_anchor_position is not None:
                             self.apply_coordinated_arm_control('right', current_target, self.right_anchor_position)
                     else:
-                        self.right_target_position = current_target.copy()
+                        self.right_target_position = current_target.copy()  # Re-set after anchor overwrote
                         if use_orientation_control:
                             error = self.apply_arm_control_with_orientation('right', current_target_wall)
                         else:
@@ -2212,6 +2280,30 @@ class WallCrawlerMuJoCoSimulation:
                     self._current_waypoint_display_idx = current_waypoint_idx
                     
                     # ================================================================
+                    # BODY REPOSITIONING - Pull body toward optimal position for reaching
+                    # ================================================================
+                    body_pos = self.get_central_body_pos()
+                    # Get anchor position
+                    if anchored_arm == 'left':
+                        anchor_pos_now = self.left_anchor_position
+                    else:
+                        anchor_pos_now = self.right_anchor_position
+                    
+                    if anchor_pos_now is not None and current_target is not None:
+                        # Midpoint between anchor and target is ideal body position
+                        midpoint = (anchor_pos_now + current_target) / 2.0
+                        body_to_mid = midpoint - body_pos
+                        mid_distance = np.linalg.norm(body_to_mid)
+                        
+                        # Apply stronger force to reposition body closer to target (was 400.0)
+                        if mid_distance > 0.05:
+                            body_vel = self.data.qvel[0:3]
+                            body_kp = 600.0  # INCREASED: More aggressive repositioning to get body closer
+                            body_kd = 50.0   # Strong damping for stability
+                            body_force = body_kp * body_to_mid - body_kd * body_vel
+                            self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                    
+                    # ================================================================
                     # STUCK DETECTION AND RECOVERY SYSTEM
                     # ================================================================
                     current_time = time.time()
@@ -2220,8 +2312,8 @@ class WallCrawlerMuJoCoSimulation:
                     if in_recovery_mode:
                         recovery_elapsed = current_time - recovery_start_time
                         
-                        # RECOVERY STRATEGY: Rotate joint1 by 180 degrees
-                        # This escapes local minima by completely changing arm configuration
+                        # RECOVERY STRATEGY: Focus on INTELLIGENT IK targeting (odd attempts are better)
+                        # This uses compute_first_joint_target which intelligently finds joint1
                         if moving_arm == 'left':
                             qpos_slice = self.left_arm_qpos_slice
                             actuator_slice = self.left_arm_actuator_slice
@@ -2229,7 +2321,7 @@ class WallCrawlerMuJoCoSimulation:
                             qpos_slice = self.right_arm_qpos_slice
                             actuator_slice = self.right_arm_actuator_slice
                         
-                        # Smoothly rotate joint1 towards target (180° from where it was)
+                        # Smoothly rotate joint1 towards target
                         current_j1 = self.data.qpos[qpos_slice][0]
                         j1_error = recovery_joint1_target - current_j1
                         
@@ -2239,8 +2331,8 @@ class WallCrawlerMuJoCoSimulation:
                         while j1_error < -np.pi:
                             j1_error += 2 * np.pi
                         
-                        # Apply joint1 rotation with high gain
-                        j1_velocity = 3.0 * j1_error  # Fast rotation
+                        # Apply joint1 rotation with optimized gain (faster for intelligent recovery)
+                        j1_velocity = recovery_j1_velocity_gain * j1_error  # Use optimized gain
                         new_j1 = current_j1 + j1_velocity * self.model.opt.timestep
                         
                         # Set joint1 command
@@ -2248,11 +2340,11 @@ class WallCrawlerMuJoCoSimulation:
                         current_cmd[0] = new_j1
                         self.data.ctrl[actuator_slice] = current_cmd
                         
-                        # Light damping on other joints
+                        # More aggressive damping on other joints for intelligent recovery
                         if moving_arm == 'left':
-                            self.data.qvel[self.left_arm_qvel_slice] *= 0.98
+                            self.data.qvel[self.left_arm_qvel_slice] *= recovery_damping_factor
                         else:
-                            self.data.qvel[self.right_arm_qvel_slice] *= 0.98
+                            self.data.qvel[self.right_arm_qvel_slice] *= recovery_damping_factor
                         
                         if phase_timer % 100 == 0:
                             print(f"  🔄 RECOVERY [{recovery_attempts}/{max_recovery_attempts}] J1: {np.degrees(current_j1):.1f}° → {np.degrees(recovery_joint1_target):.1f}° | {recovery_duration - recovery_elapsed:.1f}s left")
@@ -2263,7 +2355,7 @@ class WallCrawlerMuJoCoSimulation:
                             best_error = float('inf')  # Reset best error to give fresh start
                             last_progress_time = current_time  # Reset progress timer
                             last_best_error = float('inf')
-                            print(f"\n  ✅ Recovery {recovery_attempts} complete - J1 rotated, resuming control")
+                            print(f"\n  ✅ Recovery {recovery_attempts} complete - J1 repositioned, resuming control")
                     else:
                         # Track if error is improving
                         if error < last_best_error - stuck_error_improvement_threshold:
@@ -3033,6 +3125,7 @@ def get_random_goal_position():
         {
             'x_min': ISS_MODULE['x_min'] + 0.5, 'x_max': ISS_MODULE['x_max'] - 0.5,
             'y_min': ISS_MODULE['y_min'] + 0.3, 'y_max': ISS_MODULE['y_max'] - 0.3,
+            'z_min': ISS_MODULE['z_max'] - 0.1, 'z_max': ISS_MODULE['z_max'] - 0.1,
             'z': ISS_MODULE['z_max'] - 0.1,
             'wall': 'ceiling'
         },
@@ -3088,29 +3181,38 @@ def main():
     # Show previous run statistics
     print_success_rate()
     
+    # Run with duration limit to ensure summary/plotting is shown
     try:
         # Create simulation
         sim = WallCrawlerMuJoCoSimulation(model_path="dual_arm_robot.xml")
         
-        # Start position - LEFT WALL for left arm (pointing -Y) to reach easily
-        # Left arm points in -Y direction, so start on left wall (X=-2.1)
-        start_pos = (-2.0, 0.6, 0.3)  # Left wall, near floor
-        
-        # RANDOMIZED GOAL POSITION - different each run
+        # Random start position for robustness testing
+        print("🎲 Generating random start and goal positions...")
+        start_pos, start_wall = get_random_goal_position()
         goal_pos, goal_wall = get_random_goal_position()
-        print(f"\n🎯 RANDOM GOAL SELECTED: {goal_wall.upper()} wall")
-        print(f"   Position: ({goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f})")
         
-        # Set start and goal (this triggers path planning)
+        # Ensure goal is distinct from start (at least 2.5m away for meaningful trajectory)
+        min_trajectory_distance = 2.5  # Minimum distance for a meaningful trajectory
+        max_attempts = 50
+        attempt = 0
+        while np.linalg.norm(np.array(start_pos) - np.array(goal_pos)) < min_trajectory_distance and attempt < max_attempts:
+            goal_pos, goal_wall = get_random_goal_position()
+            attempt += 1
+        
+        if attempt >= max_attempts:
+            print(f"⚠️  Could not find goal at least {min_trajectory_distance}m away after {max_attempts} attempts")
+            
+        print(f"Start: {start_wall} {start_pos}")
+        print(f"Goal:  {goal_wall} {goal_pos}")
+        print(f"✓ Trajectory distance: {np.linalg.norm(np.array(start_pos) - np.array(goal_pos)):.2f}m")
+        
         sim.set_start_and_goal(start_pos, goal_pos)
         
         # Run visualization
         print("\nStarting MuJoCo visualization...")
         print("The robot will be displayed with the planned path.")
-        print("(Arm control will be implemented in Phase 2)")
         
-        # Run with duration limit to ensure summary/plotting is shown
-        sim.run_visualization(duration=120)  # Extended for longer paths
+        sim.run_visualization(duration=120)
         
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")
@@ -3118,7 +3220,6 @@ def main():
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
-        traceback.print_exc()
 
 
 if __name__ == "__main__":
