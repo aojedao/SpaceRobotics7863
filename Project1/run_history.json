@@ -1434,8 +1434,85 @@
       "waypoints_reached": 8,
       "total_waypoints": 8,
       "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-07T08:31:50.970077",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 8,
+      "reason": "stopped at WP3"
+    },
+    {
+      "timestamp": "2025-12-07T08:39:32.956395",
+      "success": true,
+      "waypoints_reached": 6,
+      "total_waypoints": 6,
+      "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-07T08:44:36.109813",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 10,
+      "reason": "stopped at WP1"
+    },
+    {
+      "timestamp": "2025-12-07T08:48:24.418194",
+      "success": true,
+      "waypoints_reached": 7,
+      "total_waypoints": 7,
+      "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-07T08:53:46.470785",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": "stopped at WP2"
+    },
+    {
+      "timestamp": "2025-12-07T09:55:45.885481",
+      "success": true,
+      "waypoints_reached": 6,
+      "total_waypoints": 6,
+      "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-07T10:05:14.063648",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 11,
+      "reason": "stopped at WP3"
+    },
+    {
+      "timestamp": "2025-12-07T10:10:27.884775",
+      "success": true,
+      "waypoints_reached": 6,
+      "total_waypoints": 6,
+      "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-07T10:12:13.667394",
+      "success": true,
+      "waypoints_reached": 7,
+      "total_waypoints": 7,
+      "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-07T10:17:56.984352",
+      "success": false,
+      "waypoints_reached": 4,
+      "total_waypoints": 14,
+      "reason": "stopped at WP5"
+    },
+    {
+      "timestamp": "2025-12-07T10:23:08.311197",
+      "success": true,
+      "waypoints_reached": 10,
+      "total_waypoints": 10,
+      "reason": "completed"
     }
   ],
-  "total": 205,
-  "successes": 6
+  "total": 216,
+  "successes": 12
 }

@@ -707,17 +707,530 @@ class WallCrawlerMuJoCoSimulation:
                 screw_quat = np.array([0.707, 0.0, -0.707, 0.0])  # -90° around Y
             
             self.model.body_quat[screw_body_id] = screw_quat
+            
+            # MAKE SCREW VISIBLE IMMEDIATELY - bright colors and larger size
+            self._make_screw_visible()
+            
             mujoco.mj_forward(self.model, self.data)
             
             print(f"\n  🔩 SCREW spawned at goal: ({screw_pos[0]:.2f}, {screw_pos[1]:.2f}, {screw_pos[2]:.2f})")
-            print(f"     Wall: {goal_wall}")
+            print(f"     Wall: {goal_wall}, Size: LARGE (4cm head)")
         else:
             print(f"\n  ⚠️ Could not find screw body in model")
         
         # Store screw info for later use
         self._screw_spawned = True
         self._screw_wall = goal_wall
+        self._screw_start_pos = screw_pos.copy()  # Store for unscrewing
     
+    # ========================================================================
+    # UNSCREWING TASK METHODS (integrated from debug_unscrew.py)
+    # ========================================================================
+    
+    def _make_screw_visible(self):
+        """Make the screw larger and more visible with bright colors."""
+        screw_head_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "screw_head")
+        if screw_head_id != -1:
+            self.model.geom_rgba[screw_head_id] = [1.0, 0.0, 0.0, 1.0]  # RED
+            self.model.geom_size[screw_head_id] = [0.06, 0.02, 0]  # 6cm radius - BIGGER
+        
+        screw_shaft_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "screw_shaft")
+        if screw_shaft_id != -1:
+            self.model.geom_rgba[screw_shaft_id] = [1.0, 0.3, 0.0, 1.0]  # BRIGHT ORANGE
+            self.model.geom_size[screw_shaft_id] = [0.025, 0.1, 0]  # Thicker
+        
+        screw_thread_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "screw_thread")
+        if screw_thread_id != -1:
+            self.model.geom_rgba[screw_thread_id] = [0.0, 1.0, 1.0, 1.0]  # CYAN (changed from yellow for visibility)
+            self.model.geom_size[screw_thread_id] = [0.03, 0.08, 0]  # Thicker
+        
+        # Add a big pulsing marker at screw location for visibility
+        # This will be rendered as a visualization geom
+        self._screw_marker_visible = True
+        print(f"  🔩 Screw made VERY VISIBLE: RED head (6cm), ORANGE shaft, CYAN thread")
+    
+    def _get_screw_unscrew_axis(self, wall: str) -> np.ndarray:
+        """Get the axis along which the screw moves when unscrewing (OUT of the wall)."""
+        axes = {
+            'floor': np.array([0.0, 0.0, 1.0]),       # Up out of floor
+            'ceiling': np.array([0.0, 0.0, -1.0]),    # Down out of ceiling
+            'front': np.array([0.0, -1.0, 0.0]),      # -Y out of front wall
+            'back': np.array([0.0, 1.0, 0.0]),        # +Y out of back wall
+            'left_wall': np.array([1.0, 0.0, 0.0]),   # +X out of left wall
+            'right_wall': np.array([-1.0, 0.0, 0.0]), # -X out of right wall
+        }
+        return axes.get(wall, np.array([0.0, 0.0, 1.0]))
+    
+    def _apply_j7_rotation(self, arm: str, speed: float) -> float:
+        """Apply rotation to J7 using direct position increment."""
+        if arm == 'left':
+            qpos_idx = self.left_arm_qpos_slice.start + 6
+            ctrl_idx = self.left_arm_actuator_slice.start + 6
+        else:
+            qpos_idx = self.right_arm_qpos_slice.start + 6
+            ctrl_idx = self.right_arm_actuator_slice.start + 6
+        
+        current = self.data.qpos[qpos_idx]
+        new_val = current + speed * self.model.opt.timestep
+        
+        # Set both qpos and control target
+        self.data.qpos[qpos_idx] = new_val
+        self.data.ctrl[ctrl_idx] = new_val
+        
+        return new_val
+    
+    def _apply_torque_compensation(self, arm: str):
+        """Apply Coriolis/centrifugal compensation and damping for smooth motion."""
+        if arm == 'left':
+            qvel_slice = self.left_arm_qvel_slice
+            actuator_slice = self.left_arm_actuator_slice
+        else:
+            qvel_slice = self.right_arm_qvel_slice
+            actuator_slice = self.right_arm_actuator_slice
+        
+        # Get current joint velocities
+        qvel = self.data.qvel[qvel_slice]
+        
+        # Apply velocity damping for smooth motion
+        damping_gains = np.array([5.0, 5.0, 5.0, 3.0, 2.0, 1.0, 0.5])
+        
+        # Get the passive forces (gravity + Coriolis)
+        bias_forces = self.data.qfrc_bias[qvel_slice]
+        
+        # Apply compensation to joints 1-6 (not J7)
+        for i in range(6):
+            current_ctrl = self.data.ctrl[actuator_slice.start + i]
+            compensation = bias_forces[i] * 0.001
+            self.data.ctrl[actuator_slice.start + i] = current_ctrl + compensation
+        
+        return bias_forces
+    
+    def _maintain_ee_position_and_orientation(self, arm: str, target_pos: np.ndarray, screw_axis: np.ndarray):
+        """Maintain EE position tracking screw AND strict orientation aligned with screw axis."""
+        if arm == 'left':
+            current_pos = self.get_left_gripper_pos()
+            current_orient = self.get_left_ee_orientation()
+            site_id = self.left_gripper_site_id
+            qpos_slice = self.left_arm_qpos_slice
+            actuator_slice = self.left_arm_actuator_slice
+        else:
+            current_pos = self.get_right_gripper_pos()
+            current_orient = self.get_right_ee_orientation()
+            site_id = self.right_gripper_site_id
+            qpos_slice = self.right_arm_qpos_slice
+            actuator_slice = self.right_arm_actuator_slice
+        
+        # Position error
+        pos_error = target_pos - current_pos
+        kp_pos = 800.0  # High gain for strict position tracking
+        
+        # Orientation error - EE Z-axis should align with NEGATIVE screw axis
+        desired_z = -screw_axis  # Gripper Z points into wall
+        current_z = current_orient[:, 2]
+        orient_error = np.cross(current_z, desired_z)
+        kp_orient = 200.0
+        
+        # Get Jacobians
+        jacp, jacr = self.compute_jacobian_at_site(site_id)
+        if arm == 'left':
+            J_pos = jacp[:, 6:13]
+            J_rot = jacr[:, 6:13]
+        else:
+            J_pos = jacp[:, 13:20]
+            J_rot = jacr[:, 13:20]
+        
+        # Stack position and orientation tasks
+        J_full = np.vstack([J_pos * 2.0, J_rot])  # Double weight on position
+        task_vel = np.concatenate([kp_pos * pos_error, kp_orient * orient_error])
+        
+        # Damped least squares
+        lambda_dls = 0.01
+        JJT = J_full @ J_full.T
+        J_pinv = J_full.T @ np.linalg.inv(JJT + lambda_dls**2 * np.eye(6))
+        joint_vel = J_pinv @ task_vel
+        
+        # Apply to joints 1-6 only (not J7)
+        current_q = self.data.qpos[qpos_slice].copy()
+        dt = self.model.opt.timestep
+        for i in range(6):
+            current_q[i] += joint_vel[i] * dt
+            self.data.ctrl[actuator_slice.start + i] = current_q[i]
+        
+        return np.linalg.norm(pos_error), np.linalg.norm(orient_error)
+    
+    def _init_unscrew_task(self, screw_arm: str, anchor_arm: str, screw_wall: str):
+        """Initialize the unscrewing task state variables."""
+        self._unscrew_arm = screw_arm
+        self._unscrew_anchor_arm = anchor_arm
+        self._unscrew_wall = screw_wall
+        self._unscrew_axis = self._get_screw_unscrew_axis(screw_wall)
+        
+        # Get screw body info
+        self._unscrew_screw_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "screw")
+        self._unscrew_screw_start_pos = self.data.xpos[self._unscrew_screw_body_id].copy()
+        
+        # Unscrew parameters
+        self._unscrew_speed = 6.0  # rad/s
+        self._unscrew_thread_pitch = 0.015  # 15mm per revolution
+        self._unscrew_max_displacement = 0.15  # 150mm max
+        self._unscrew_total_rotation = 0.0
+        self._unscrew_complete = False
+        self._unscrew_target_rotations = 3.0  # 3 full turns
+        
+        # ============================================================
+        # POSITIONING PHASE PARAMETERS - wait before starting rotation
+        # ============================================================
+        self._unscrew_positioning_phase = True  # Start in positioning mode
+        self._unscrew_positioning_duration = 1.5  # seconds to position before rotating
+        self._unscrew_positioning_start_time = self.data.time
+        self._unscrew_positioning_kp_pos = 1500.0  # Stricter position control (was ~800)
+        self._unscrew_positioning_kp_orient = 400.0  # Stricter orientation control (was ~200)
+        
+        # ============================================================
+        # ALIGNMENT ERROR TRACKING for plotting
+        # ============================================================
+        self._unscrew_alignment_log = []  # (time, alignment_error_rad, phase)
+        self._unscrew_j7_log = []  # (time, j7_angle_rad)
+        self._unscrew_ee_pos_log = []  # (time, ee_pos)
+        self._unscrew_screw_pos_log = []  # (time, screw_pos)
+        
+        # Store initial J7 position
+        if screw_arm == 'left':
+            self._unscrew_j7_start = self.data.qpos[self.left_arm_qpos_slice.start + 6]
+        else:
+            self._unscrew_j7_start = self.data.qpos[self.right_arm_qpos_slice.start + 6]
+        
+        # Lock anchor arm and body
+        self._unscrew_locked_body_pos = self.data.qpos[0:3].copy()
+        self._unscrew_locked_body_quat = self.data.qpos[3:7].copy()
+        
+        if anchor_arm == 'left':
+            self._unscrew_locked_anchor_joints = self.data.qpos[self.left_arm_qpos_slice].copy()
+        else:
+            self._unscrew_locked_anchor_joints = self.data.qpos[self.right_arm_qpos_slice].copy()
+        
+        # Store target EE orientation (aligned with screw axis)
+        # Get current EE orientation for positioning target
+        if screw_arm == 'left':
+            ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_gripper_center")
+        else:
+            ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_gripper_center")
+        self._unscrew_ee_site_id = ee_site_id
+        
+        # Target EE position = screw position
+        self._unscrew_target_ee_pos = self.data.xpos[self._unscrew_screw_body_id].copy()
+        
+        # Make screw visible
+        self._make_screw_visible()
+        
+        print(f"\n🔩 UNSCREW TASK INITIALIZED")
+        print(f"   Screw arm: {screw_arm.upper()}, Anchor arm: {anchor_arm.upper()}")
+        print(f"   Wall: {screw_wall}, Axis: {self._unscrew_axis}")
+        print(f"   Speed: {self._unscrew_speed:.1f} rad/s, Pitch: {self._unscrew_thread_pitch*1000:.1f}mm/rev")
+        print(f"   📐 POSITIONING PHASE: {self._unscrew_positioning_duration:.1f}s delay before rotation")
+        print(f"   📊 Alignment tracking enabled for plotting")
+    
+    def _calculate_alignment_error(self) -> float:
+        """Calculate the alignment error between EE Z-axis and screw axis.
+        Returns error in radians (0 = perfectly aligned)."""
+        # Get EE rotation matrix (3x3) from site
+        ee_rotmat = self.data.site_xmat[self._unscrew_ee_site_id].reshape(3, 3)
+        
+        # EE Z-axis is the 3rd column of rotation matrix
+        ee_z_axis = ee_rotmat[:, 2]
+        
+        # Screw axis (direction we want EE to point)
+        screw_axis = self._unscrew_axis
+        
+        # Alignment error = angle between EE Z-axis and screw axis
+        # For unscrewing, EE should point ALONG screw axis (into the wall)
+        # But for rotating, we want EE Z to be perpendicular or aligned based on task
+        # Here we measure how well EE Z aligns with the screw axis
+        dot_product = np.clip(np.dot(ee_z_axis, screw_axis), -1.0, 1.0)
+        alignment_error = np.arccos(np.abs(dot_product))  # 0 = aligned (either direction)
+        
+        return alignment_error
+    
+    def _step_positioning_phase(self) -> bool:
+        """Execute one step of the ACTIVE ALIGNMENT phase.
+        Runs IK + torque compensation to align EE with screw axis.
+        Returns True when alignment error is small enough to start rotation."""
+        current_time = self.data.time
+        elapsed = current_time - self._unscrew_positioning_start_time
+        
+        # Calculate alignment error
+        alignment_error = self._calculate_alignment_error()
+        self._unscrew_alignment_log.append((elapsed, alignment_error, 'aligning'))
+        
+        # Log J7 position
+        if self._unscrew_arm == 'left':
+            j7_val = self.data.qpos[self.left_arm_qpos_slice.start + 6]
+            ee_pos = self.get_left_gripper_pos()
+            qpos_slice = self.left_arm_qpos_slice
+            actuator_slice = self.left_arm_actuator_slice
+        else:
+            j7_val = self.data.qpos[self.right_arm_qpos_slice.start + 6]
+            ee_pos = self.get_right_gripper_pos()
+            qpos_slice = self.right_arm_qpos_slice
+            actuator_slice = self.right_arm_actuator_slice
+        
+        self._unscrew_j7_log.append((elapsed, j7_val))
+        self._unscrew_ee_pos_log.append((elapsed, ee_pos.copy()))
+        self._unscrew_screw_pos_log.append((elapsed, self.data.xpos[self._unscrew_screw_body_id].copy()))
+        
+        # Lock body and anchor arm
+        self._lock_all_for_unscrew()
+        
+        # ============================================================
+        # ACTIVE ALIGNMENT: Run IK + torque compensation to align EE
+        # ============================================================
+        
+        # Apply torque compensation for smooth motion
+        self._apply_torque_compensation(self._unscrew_arm)
+        
+        # Use IK to maintain position and align orientation with screw axis
+        screw_pos = self.data.xpos[self._unscrew_screw_body_id].copy()
+        pos_error, orient_error = self._maintain_ee_position_and_orientation(
+            self._unscrew_arm, 
+            screw_pos,
+            self._unscrew_axis
+        )
+        
+        # Keep J7 at start position during alignment (don't rotate yet)
+        self.data.qpos[qpos_slice.start + 6] = self._unscrew_j7_start
+        self.data.ctrl[actuator_slice.start + 6] = self._unscrew_j7_start
+        
+        # Print progress periodically
+        step_count = int(elapsed / self.model.opt.timestep)
+        if step_count % 100 == 0:
+            error_deg = np.degrees(alignment_error)
+            print(f"  📐 ALIGNING: {elapsed:.2f}s | Error: {error_deg:.1f}° | Pos err: {pos_error*1000:.1f}mm")
+        
+        # ============================================================
+        # CHECK IF READY TO START ROTATION
+        # Conditions: alignment error < threshold OR max time reached
+        # ============================================================
+        alignment_threshold_deg = 15.0  # Start rotation when < 15° error
+        alignment_threshold_rad = np.radians(alignment_threshold_deg)
+        min_alignment_time = 0.5  # At least 0.5s of alignment before checking
+        max_alignment_time = 3.0  # Max 3s of alignment, then start anyway
+        
+        alignment_good = alignment_error < alignment_threshold_rad
+        time_ok = elapsed >= min_alignment_time
+        timed_out = elapsed >= max_alignment_time
+        
+        if (alignment_good and time_ok) or timed_out:
+            error_deg = np.degrees(alignment_error)
+            if timed_out and not alignment_good:
+                print(f"\n  ⚠️ ALIGNMENT TIMEOUT after {elapsed:.1f}s")
+                print(f"     Alignment error: {error_deg:.1f}° (threshold: {alignment_threshold_deg}°)")
+                print(f"     Starting rotation anyway...")
+            else:
+                print(f"\n  ✅ ALIGNMENT COMPLETE in {elapsed:.1f}s")
+                print(f"     Final alignment error: {error_deg:.1f}°")
+                print(f"     Starting rotation phase...")
+            
+            # Store locked joint positions for rotation phase
+            self._unscrew_locked_screw_arm_j1_6 = self.data.qpos[qpos_slice][:6].copy()
+            return True
+        
+        return False
+    
+    def _step_unscrew_task(self) -> bool:
+        """Execute one step of the unscrewing task. Returns True when complete."""
+        if self._unscrew_complete:
+            # After completion, keep everything locked
+            self._lock_all_for_unscrew()
+            return True
+        
+        # ============================================================
+        # POSITIONING PHASE - wait and stabilize before rotating
+        # ============================================================
+        if self._unscrew_positioning_phase:
+            if self._step_positioning_phase():
+                self._unscrew_positioning_phase = False  # Move to rotation phase
+                self._unscrew_rotation_start_time = self.data.time
+            return False
+        
+        # ============================================================
+        # ROTATION PHASE - rotate J7 to unscrew
+        # ============================================================
+        current_time = self.data.time
+        elapsed = current_time - self._unscrew_positioning_start_time  # Total elapsed time
+        
+        # Log alignment error
+        alignment_error = self._calculate_alignment_error()
+        self._unscrew_alignment_log.append((elapsed, alignment_error, 'rotation'))
+        
+        # Log J7 position
+        if self._unscrew_arm == 'left':
+            j7_val = self.data.qpos[self.left_arm_qpos_slice.start + 6]
+            ee_pos = self.get_left_gripper_pos()
+        else:
+            j7_val = self.data.qpos[self.right_arm_qpos_slice.start + 6]
+            ee_pos = self.get_right_gripper_pos()
+        self._unscrew_j7_log.append((elapsed, j7_val))
+        self._unscrew_ee_pos_log.append((elapsed, ee_pos.copy()))
+        self._unscrew_screw_pos_log.append((elapsed, self.data.xpos[self._unscrew_screw_body_id].copy()))
+        
+        # Get current arm slices
+        if self._unscrew_arm == 'left':
+            qpos_slice = self.left_arm_qpos_slice
+            actuator_slice = self.left_arm_actuator_slice
+        else:
+            qpos_slice = self.right_arm_qpos_slice
+            actuator_slice = self.right_arm_actuator_slice
+        
+        # Calculate rotation increment
+        rotation_inc = self._unscrew_speed * self.model.opt.timestep
+        self._unscrew_total_rotation += rotation_inc
+        
+        # Calculate expected screw displacement based on rotation
+        expected_disp = min(
+            (self._unscrew_total_rotation / (2*np.pi)) * self._unscrew_thread_pitch,
+            self._unscrew_max_displacement
+        )
+        
+        # ONLY rotate J7 - keep joints 1-6 LOCKED
+        j7_val = self._apply_j7_rotation(self._unscrew_arm, self._unscrew_speed)
+        
+        # Hold joints 1-6 fixed
+        for i in range(6):
+            self.data.qpos[qpos_slice.start + i] = self._unscrew_locked_screw_arm_j1_6[i]
+            self.data.ctrl[actuator_slice.start + i] = self._unscrew_locked_screw_arm_j1_6[i]
+        
+        # Move screw along its axis (screw comes OUT of wall)
+        screw_new_pos = self._unscrew_screw_start_pos + self._unscrew_axis * expected_disp
+        self.model.body_pos[self._unscrew_screw_body_id] = screw_new_pos
+        
+        # Lock anchor arm and body
+        self._lock_all_for_unscrew()
+        
+        # Check if complete
+        rotations = self._unscrew_total_rotation / (2 * np.pi)
+        if rotations >= self._unscrew_target_rotations:
+            self._unscrew_complete = True
+            # Store final screw position
+            self._unscrew_final_screw_pos = screw_new_pos.copy()
+            print(f"\n  ✅ UNSCREW COMPLETE!")
+            print(f"     Rotations: {rotations:.1f}")
+            print(f"     Displacement: {expected_disp*1000:.1f}mm")
+            j7_deg = np.degrees(j7_val - self._unscrew_j7_start)
+            print(f"     J7 rotation: {j7_deg:.0f}°")
+            
+            # Plot alignment graph
+            self._plot_unscrew_alignment()
+            return True
+        
+        return False
+    
+    def _plot_unscrew_alignment(self):
+        """Plot the Z-axis alignment error over time."""
+        try:
+            import matplotlib.pyplot as plt
+            
+            if not self._unscrew_alignment_log:
+                print("  ⚠️ No alignment data to plot")
+                return
+            
+            times = [t for t, _, _ in self._unscrew_alignment_log]
+            errors = [np.degrees(e) for _, e, _ in self._unscrew_alignment_log]
+            phases = [p for _, _, p in self._unscrew_alignment_log]
+            
+            # Find phase transition point
+            positioning_end_idx = 0
+            for i, p in enumerate(phases):
+                if p == 'rotation':
+                    positioning_end_idx = i
+                    break
+            
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            
+            # Plot 1: Alignment error over time
+            ax1 = axes[0, 0]
+            ax1.plot(times, errors, 'b-', linewidth=1.5, label='Alignment Error')
+            if positioning_end_idx > 0:
+                ax1.axvline(x=times[positioning_end_idx], color='r', linestyle='--', 
+                           label=f'Rotation starts ({times[positioning_end_idx]:.1f}s)')
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel('Alignment Error (degrees)')
+            ax1.set_title('EE Z-axis vs Screw Axis Alignment Error')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_ylim(0, max(90, max(errors) + 5))
+            
+            # Plot 2: J7 angle over time
+            ax2 = axes[0, 1]
+            j7_times = [t for t, _ in self._unscrew_j7_log]
+            j7_angles = [np.degrees(a - self._unscrew_j7_start) for _, a in self._unscrew_j7_log]
+            ax2.plot(j7_times, j7_angles, 'g-', linewidth=1.5)
+            if positioning_end_idx > 0:
+                ax2.axvline(x=times[positioning_end_idx], color='r', linestyle='--')
+            ax2.set_xlabel('Time (s)')
+            ax2.set_ylabel('J7 Rotation (degrees)')
+            ax2.set_title('J7 (Wrist) Rotation')
+            ax2.grid(True, alpha=0.3)
+            
+            # Plot 3: EE-Screw distance over time
+            ax3 = axes[1, 0]
+            ee_screw_dist = []
+            for (t, ee), (_, screw) in zip(self._unscrew_ee_pos_log, self._unscrew_screw_pos_log):
+                dist = np.linalg.norm(ee - screw) * 1000  # mm
+                ee_screw_dist.append((t, dist))
+            dist_times = [t for t, _ in ee_screw_dist]
+            dist_vals = [d for _, d in ee_screw_dist]
+            ax3.plot(dist_times, dist_vals, 'm-', linewidth=1.5)
+            if positioning_end_idx > 0:
+                ax3.axvline(x=times[positioning_end_idx], color='r', linestyle='--')
+            ax3.set_xlabel('Time (s)')
+            ax3.set_ylabel('Distance (mm)')
+            ax3.set_title('EE to Screw Distance')
+            ax3.grid(True, alpha=0.3)
+            
+            # Plot 4: Screw displacement along axis
+            ax4 = axes[1, 1]
+            screw_disp = []
+            for t, screw_pos in self._unscrew_screw_pos_log:
+                disp = np.dot(screw_pos - self._unscrew_screw_start_pos, self._unscrew_axis) * 1000
+                screw_disp.append((t, disp))
+            disp_times = [t for t, _ in screw_disp]
+            disp_vals = [d for _, d in screw_disp]
+            ax4.plot(disp_times, disp_vals, 'orange', linewidth=1.5)
+            if positioning_end_idx > 0:
+                ax4.axvline(x=times[positioning_end_idx], color='r', linestyle='--')
+            ax4.set_xlabel('Time (s)')
+            ax4.set_ylabel('Displacement (mm)')
+            ax4.set_title('Screw Displacement (along axis)')
+            ax4.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig('/home/user/Documents/NYU/SpaceRobotics/SpaceRobotics7863/Project1/unscrew_alignment.png', dpi=150)
+            print(f"\n  📊 Alignment plot saved to: unscrew_alignment.png")
+            plt.show(block=False)
+            plt.pause(0.5)
+            
+        except Exception as e:
+            print(f"  ⚠️ Could not plot alignment: {e}")
+    
+    def _lock_all_for_unscrew(self):
+        """Lock body, anchor arm, and optionally final screw position."""
+        # Lock body position and orientation
+        self.data.qpos[0:3] = self._unscrew_locked_body_pos
+        self.data.qpos[3:7] = self._unscrew_locked_body_quat
+        self.data.qvel[0:6] = 0.0
+        
+        # Lock anchor arm
+        if self._unscrew_anchor_arm == 'left':
+            self.data.qpos[self.left_arm_qpos_slice] = self._unscrew_locked_anchor_joints
+            self.data.qvel[self.left_arm_qvel_slice] = 0.0
+        else:
+            self.data.qpos[self.right_arm_qpos_slice] = self._unscrew_locked_anchor_joints
+            self.data.qvel[self.right_arm_qvel_slice] = 0.0
+        
+        # Lock screw position if we have final position
+        if hasattr(self, '_unscrew_final_screw_pos'):
+            self.model.body_pos[self._unscrew_screw_body_id] = self._unscrew_final_screw_pos
+
     def _transition_state(self, new_state: RobotState):
         """Transition the state machine to a new state"""
         old_state = self.robot_state
@@ -1654,15 +2167,16 @@ class WallCrawlerMuJoCoSimulation:
                                    size=line_width, rgba=line_color)
         
         # 6. Draw current arm targets with highlights
+        # Use SMALL transparent markers so screw is visible through them
         if self.left_target_position is not None:
-            self._add_marker_geom(scene, tuple(self.left_target_position), size=0.12, rgba=YELLOW)
+            # Small transparent ring instead of solid sphere (so screw shows through)
+            YELLOW_TRANSPARENT = (1.0, 1.0, 0.0, 0.25)  # Very transparent
+            self._add_marker_geom(scene, tuple(self.left_target_position), size=0.15, rgba=YELLOW_TRANSPARENT)
         
         if self.right_target_position is not None:
-            # Large orange sphere for the second target
-            BRIGHT_ORANGE = (1.0, 0.6, 0.0, 1.0)
-            self._add_marker_geom(scene, tuple(self.right_target_position), size=0.10, rgba=BRIGHT_ORANGE)
-            # Yellow highlight ring around it
-            self._add_marker_geom(scene, tuple(self.right_target_position), size=0.14, rgba=YELLOW)
+            # Transparent orange for second target
+            ORANGE_TRANSPARENT = (1.0, 0.6, 0.0, 0.25)
+            self._add_marker_geom(scene, tuple(self.right_target_position), size=0.12, rgba=ORANGE_TRANSPARENT)
         
         # 7. Draw trajectory line between anchors (BLUE line from left anchor to right target)
         if self.left_anchor_position is not None and self.right_target_position is not None:
@@ -1672,6 +2186,18 @@ class WallCrawlerMuJoCoSimulation:
                                tuple(self.right_target_position), 
                                size=0.02,
                                rgba=BRIGHT_BLUE)
+        
+        # 8. Draw SCREW MARKER - big bright sphere at screw location
+        if getattr(self, '_screw_spawned', False):
+            screw_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "screw")
+            if screw_body_id != -1:
+                screw_pos = self.data.xpos[screw_body_id]
+                # MAGENTA pulsing marker - very visible
+                SCREW_MARKER = (1.0, 0.0, 1.0, 0.9)  # Magenta
+                self._add_marker_geom(scene, tuple(screw_pos), size=0.08, rgba=SCREW_MARKER)
+                # Add a second larger transparent ring
+                SCREW_RING = (1.0, 1.0, 0.0, 0.4)  # Yellow transparent
+                self._add_marker_geom(scene, tuple(screw_pos), size=0.12, rgba=SCREW_RING)
     
     def run_headless(self, duration: float = 300):
         """
@@ -2771,50 +3297,42 @@ class WallCrawlerMuJoCoSimulation:
                             print(f"  [{phase_timer:5d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Best: {best_error:.3f}m")
                 
                 elif crawl_phase == 'trajectory_complete':
-                    # FINAL POSITION: Lock anchored arm completely, free arm available for screw task
+                    # FINAL POSITION: Execute unscrewing task with proper IK control
                     phase_timer += 1
                     
-                    # Initialize final locking state and screw task
-                    if not hasattr(self, '_final_locked'):
-                        self._final_locked = True
-                        self._screw_task_started = False
-                        self._screw_spawn_delay = 100  # Wait 100 steps before spawning screw
-                        self._screw_rotation_started = False
-                        self._screw_rotation_angle = 0.0
-                        self._screw_rotation_speed = 0.5  # rad/s
-                        self._screw_total_rotations = 3.0  # 3 full turns
-                        self._screw_task_complete = False
+                    # Initialize unscrewing task on first entry
+                    if not hasattr(self, '_unscrew_initialized') or not self._unscrew_initialized:
+                        self._unscrew_initialized = True
+                        self._unscrew_delay = 50  # Wait 50 steps before starting
+                        self._unscrew_started = False
                         
-                        # Determine which arm reached the final waypoint (is anchored)
-                        # and which arm is free for screw task
+                        # Determine which arm reached the final waypoint (is anchored at screw)
+                        # That arm does the unscrewing, the other provides anchor support
                         if self.left_anchor_position is not None and self.right_anchor_position is None:
-                            self._final_anchored_arm = 'left'
-                            self._final_free_arm = 'right'
-                            # Lock left arm joint positions (CURRENT values, not changed)
-                            self._final_anchored_joints = self.data.qpos[7:14].copy()
-                            self._screw_arm = 'left'  # The anchored arm drives the screw
-                            print(f"\n  🔒 FINAL POSITION - ANCHORED ARM LOCKED")
-                            print(f"  🔒 LEFT arm joints FROZEN at current values")
-                            print(f"  🆓 RIGHT arm FREE for torque balancing")
+                            screw_arm = 'left'
+                            anchor_arm = 'right'
+                            print(f"\n  🔒 FINAL POSITION REACHED")
+                            print(f"     LEFT arm at screw → will unscrew")
+                            print(f"     RIGHT arm provides anchor support")
                         elif self.right_anchor_position is not None and self.left_anchor_position is None:
-                            self._final_anchored_arm = 'right'
-                            self._final_free_arm = 'left'
-                            # Lock right arm joint positions
-                            self._final_anchored_joints = self.data.qpos[22:29].copy()
-                            self._screw_arm = 'right'
-                            print(f"\n  🔒 FINAL POSITION - ANCHORED ARM LOCKED")
-                            print(f"  🔒 RIGHT arm joints FROZEN at current values")
-                            print(f"  🆓 LEFT arm FREE for torque balancing")
+                            screw_arm = 'right'
+                            anchor_arm = 'left'
+                            print(f"\n  🔒 FINAL POSITION REACHED")
+                            print(f"     RIGHT arm at screw → will unscrew")
+                            print(f"     LEFT arm provides anchor support")
                         else:
-                            # Both or neither anchored - lock both
-                            self._final_anchored_arm = 'both'
-                            self._final_free_arm = None
-                            self._final_anchored_joints_left = self.data.qpos[7:14].copy()
-                            self._final_anchored_joints_right = self.data.qpos[22:29].copy()
-                            self._screw_arm = 'left'  # Default
-                            print(f"\n  🔒 FINAL POSITION - BOTH ARMS LOCKED")
+                            # Default case - use left arm
+                            screw_arm = 'left'
+                            anchor_arm = 'right'
+                            print(f"\n  🔒 FINAL POSITION - defaulting to LEFT arm for unscrew")
                         
-                        # Store final body position
+                        self._unscrew_screw_arm = screw_arm
+                        self._unscrew_anchor_arm_name = anchor_arm
+                        
+                        # Get the screw wall from stored info
+                        screw_wall = getattr(self, '_screw_wall', 'back')
+                        
+                        # Store body position for locking
                         self._final_body_pos = self.get_central_body_pos().copy()
                         self._final_body_quat = self.data.qpos[3:7].copy()
                         print(f"  🔒 Body locked at: ({self._final_body_pos[0]:.2f}, {self._final_body_pos[1]:.2f}, {self._final_body_pos[2]:.2f})")
@@ -2822,114 +3340,38 @@ class WallCrawlerMuJoCoSimulation:
                         # Mark trajectory as successful
                         trajectory_success = True
                     
-                    # ============================================================
-                    # SCREW TASK: Start rotation (screw already at goal position)
-                    # ============================================================
-                    if phase_timer >= self._screw_spawn_delay and not self._screw_task_started:
-                        self._screw_task_started = True
-                        
-                        # Screw is already spawned at goal - just start rotation
-                        print(f"\n  🔩 SCREW TASK STARTED")
-                        print(f"     Starting screw rotation with {self._screw_arm.upper()} arm joint7...")
-                        
-                        self._screw_rotation_started = True
-                        self._screw_start_time = time.time()
+                    # Start unscrewing after delay
+                    if phase_timer >= self._unscrew_delay and not self._unscrew_started:
+                        self._unscrew_started = True
+                        screw_wall = getattr(self, '_screw_wall', 'back')
+                        self._init_unscrew_task(
+                            self._unscrew_screw_arm, 
+                            self._unscrew_anchor_arm_name,
+                            screw_wall
+                        )
                     
-                    # ============================================================
-                    # SCREW ROTATION: Rotate joint7 and apply torque balancing
-                    # ============================================================
-                    if self._screw_rotation_started and not self._screw_task_complete:
-                        elapsed = time.time() - self._screw_start_time
-                        target_angle = self._screw_rotation_speed * elapsed
+                    # Execute unscrewing step
+                    if self._unscrew_started:
+                        unscrew_complete = self._step_unscrew_task()
                         
-                        # Limit to total rotation
-                        max_angle = self._screw_total_rotations * 2 * np.pi
-                        if target_angle >= max_angle:
-                            target_angle = max_angle
-                            if not self._screw_task_complete:
-                                self._screw_task_complete = True
-                                print(f"\n  ✅ SCREW TASK COMPLETE!")
-                                print(f"     {self._screw_total_rotations} rotations completed in {elapsed:.1f}s")
-                                
-                                # Print GLOBAL SUCCESS here
-                                final_body_error = np.linalg.norm(self.get_central_body_pos() - self._final_body_pos)
-                                print(f"  Final screw angle: {np.degrees(self._screw_rotation_angle):.1f}°")
-                                print(f"  Final body position error: {final_body_error:.4f}m")
-                                print(f"============================================================")
-                                print(f"✅ GLOBAL_SUCCESS_TOKEN") # Unique string for test runner
-                                print(f"✅ MISSION COMPLETE")
-                        
-                        # Apply rotation to joint7 of the screw arm
-                        if self._screw_arm == 'left':
-                            # Get base joint7 angle and add rotation
-                            base_angle = self._final_anchored_joints[6]  # joint7 is index 6
-                            new_angle = base_angle + target_angle
-                            # Clamp to joint limits
-                            new_angle = np.clip(new_angle, -3.05, 3.05)
-                            self._final_anchored_joints[6] = new_angle
-                            
-                            # TORQUE BALANCING: The reaction torque from rotating joint7
-                            # needs to be balanced by the body or the free arm
-                            # Calculate reaction torque (simplified)
-                            reaction_torque = 0.1 * self._screw_rotation_speed  # Nm
-                            
-                            # Apply counter-rotation to body (yaw) to balance
-                            # or use the free arm to provide counter-torque
-                            if self._final_free_arm == 'right':
-                                # Apply small counter-motion to right arm joint7
-                                # This represents the free arm providing stabilization
-                                counter_angle = -target_angle * 0.3  # 30% counter-rotation
-                                right_joints = self.data.qpos[22:29].copy()
-                                right_joints[6] = np.clip(right_joints[6] + counter_angle * 0.01, -3.05, 3.05)
-                                self.data.ctrl[self.right_arm_actuator_slice] = right_joints
-                            
-                        else:  # right arm drives screw
-                            base_angle = self._final_anchored_joints[6]
-                            new_angle = base_angle + target_angle
-                            new_angle = np.clip(new_angle, -3.05, 3.05)
-                            self._final_anchored_joints[6] = new_angle
-                            
-                            # Torque balancing with left arm
-                            if self._final_free_arm == 'left':
-                                counter_angle = -target_angle * 0.3
-                                left_joints = self.data.qpos[7:14].copy()
-                                left_joints[6] = np.clip(left_joints[6] + counter_angle * 0.01, -3.05, 3.05)
-                                self.data.ctrl[self.left_arm_actuator_slice] = left_joints
+                        if unscrew_complete and not hasattr(self, '_mission_complete_printed'):
+                            self._mission_complete_printed = True
+                            print(f"============================================================")
+                            print(f"✅ GLOBAL_SUCCESS_TOKEN")
+                            print(f"✅ MISSION COMPLETE")
                         
                         # Print status periodically
-                        if phase_timer % 250 == 0 and not self._screw_task_complete:
-                            rotations = target_angle / (2 * np.pi)
-                            print(f"  🔩 Screw rotation: {rotations:.2f}/{self._screw_total_rotations} turns")
-                    
-                    # FORCE LOCK anchored arm joints - zero velocity, restore positions
-                    if self._final_anchored_arm == 'left':
-                        # Force left arm to locked positions (with updated joint7 for screw)
-                        self.data.qpos[7:14] = self._final_anchored_joints.copy()
-                        self.data.qvel[6:13] = 0.0  # Zero velocities
-                        self.data.ctrl[self.left_arm_actuator_slice] = self._final_anchored_joints.copy()
-                    elif self._final_anchored_arm == 'right':
-                        # Force right arm to locked positions
-                        self.data.qpos[22:29] = self._final_anchored_joints.copy()
-                        self.data.qvel[21:28] = 0.0  # Zero velocities
-                        self.data.ctrl[self.right_arm_actuator_slice] = self._final_anchored_joints.copy()
+                        if phase_timer % 250 == 0 and not self._unscrew_complete:
+                            rotations = self._unscrew_total_rotation / (2 * np.pi)
+                            ee_pos = self.get_left_gripper_pos() if self._unscrew_arm == 'left' else self.get_right_gripper_pos()
+                            screw_pos = self.data.xpos[self._unscrew_screw_body_id]
+                            ee_dist = np.linalg.norm(ee_pos - screw_pos) * 1000
+                            print(f"  🔩 Unscrew: {rotations:.2f}/{self._unscrew_target_rotations} turns | EE-screw: {ee_dist:.0f}mm")
                     else:
-                        # Both arms locked
-                        self.data.qpos[7:14] = self._final_anchored_joints_left.copy()
-                        self.data.qpos[22:29] = self._final_anchored_joints_right.copy()
-                        self.data.qvel[6:13] = 0.0
-                        self.data.qvel[21:28] = 0.0
-                        self.data.ctrl[self.left_arm_actuator_slice] = self._final_anchored_joints_left.copy()
-                        self.data.ctrl[self.right_arm_actuator_slice] = self._final_anchored_joints_right.copy()
-                    
-                    # Force-restore body position
-                    self.data.qpos[0:3] = self._final_body_pos.copy()
-                    self.data.qpos[3:7] = self._final_body_quat.copy()
-                    self.data.qvel[0:6] = 0.0
-                    
-                    if phase_timer % 500 == 0 and self._screw_task_complete:
-                        body_pos = self.get_central_body_pos()
-                        free_str = f" | FREE arm: {self._final_free_arm.upper()}" if self._final_free_arm else ""
-                        print(f"  [HOLDING] Body at ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){free_str}")
+                        # Lock body during delay
+                        self.data.qpos[0:3] = self._final_body_pos
+                        self.data.qpos[3:7] = self._final_body_quat
+                        self.data.qvel[0:6] = 0.0
                 
                 elif crawl_phase == 'failed':
                     # Error state - just hold position
