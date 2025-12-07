@@ -601,8 +601,519 @@
       "waypoints_reached": 8,
       "total_waypoints": 8,
       "reason": "completed"
+    },
+    {
+      "timestamp": "2025-12-06T18:28:57.123808",
+      "success": false,
+      "waypoints_reached": 9,
+      "total_waypoints": 12,
+      "reason": "stopped at WP10"
+    },
+    {
+      "timestamp": "2025-12-06T18:42:40.739901",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 6,
+      "reason": "stopped at WP3"
+    },
+    {
+      "timestamp": "2025-12-06T18:50:05.701124",
+      "success": false,
+      "waypoints_reached": 4,
+      "total_waypoints": 9,
+      "reason": "stopped at WP5"
+    },
+    {
+      "timestamp": "2025-12-06T18:56:27.599722",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": "stopped at WP2"
+    },
+    {
+      "timestamp": "2025-12-06T18:59:57.296587",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 7,
+      "reason": "stopped at WP1"
+    },
+    {
+      "timestamp": "2025-12-06T19:00:07.424797",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": "stopped at WP2"
+    },
+    {
+      "timestamp": "2025-12-06T19:02:43.941004",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 6,
+      "reason": "stopped at WP2"
+    },
+    {
+      "timestamp": "2025-12-06T19:07:52.892296",
+      "success": false,
+      "waypoints_reached": 5,
+      "total_waypoints": 6,
+      "reason": "stopped at WP6"
+    },
+    {
+      "timestamp": "2025-12-06T20:10:40.071291",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 7,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:10:51.987918",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:11:17.274165",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:12:24.400804",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:13:05.057772",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:13:59.584334",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:15:14.351725",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:15:19.531255",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:15:51.440480",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 2,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:16:09.661268",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 6,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:17:03.799207",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 7,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:17:05.334826",
+      "success": false,
+      "waypoints_reached": 9,
+      "total_waypoints": 12,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:17:50.778820",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 14,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:17:58.619667",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:18:05.527293",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 12,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:18:48.781572",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:20:20.430797",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 12,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:20:39.835403",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 14,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:20:46.308554",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 11,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:20:47.322412",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:21:21.288496",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:21:56.930752",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:22:45.184083",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:22:49.297362",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:23:59.031700",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 15,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:23:59.531842",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:24:07.702719",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 14,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:25:02.249560",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 12,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:25:23.716370",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 7,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:25:35.400895",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 6,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:26:26.442657",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 11,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:27:10.535624",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:27:27.585452",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:27:36.066148",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:28:21.176858",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:28:51.717598",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:29:26.939397",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:29:40.818372",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 13,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:30:34.672859",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:30:38.010651",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 17,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:30:51.192074",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 15,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:31:25.238189",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 11,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:31:33.059057",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 19,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:32:33.559428",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 7,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:33:13.780852",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 12,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:33:29.560575",
+      "success": false,
+      "waypoints_reached": 3,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:34:00.184780",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:34:54.713170",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:35:22.022600",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:35:39.422341",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:36:28.680247",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 11,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:36:46.887500",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:37:28.302944",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:39:06.482001",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:40:26.193488",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:41:43.094641",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 7,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:42:20.313841",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 17,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:43:55.720803",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 13,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:45:14.335284",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 9,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:46:45.688545",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 12,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:48:07.130309",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 8,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:49:08.818089",
+      "success": false,
+      "waypoints_reached": 1,
+      "total_waypoints": 10,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T20:49:43.656295",
+      "success": false,
+      "waypoints_reached": 0,
+      "total_waypoints": 16,
+      "reason": ""
+    },
+    {
+      "timestamp": "2025-12-06T21:15:33.949351",
+      "success": false,
+      "waypoints_reached": 4,
+      "total_waypoints": 9,
+      "reason": "stopped at WP5"
+    },
+    {
+      "timestamp": "2025-12-06T21:18:19.373181",
+      "success": false,
+      "waypoints_reached": 2,
+      "total_waypoints": 6,
+      "reason": "stopped at WP3"
     }
   ],
-  "total": 86,
+  "total": 159,
   "successes": 3
 }
