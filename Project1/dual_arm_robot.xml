@@ -548,7 +548,7 @@
     <!-- ============================================== -->
     <!-- SCREW - Task object for screw insertion -->
     <!-- ============================================== -->
-    <body name="screw" pos="100 100 100">
+    <body name="screw" pos="1 1 1">
       <inertial mass="0.05" pos="0 0 0.015" diaginertia="0.00001 0.00001 0.000005"/>
       <!-- Screw head (hexagonal approximated by cylinder) -->
       <geom name="screw_head" type="cylinder" size="0.012 0.004" pos="0 0 0" 
@@ -560,7 +560,7 @@
       <geom name="screw_thread" type="cylinder" size="0.005 0.020" pos="0 0 0.024" 
             rgba="0.4 0.4 0.45 0.5" contype="0" conaffinity="0"/>
       <!-- Site for screw attachment -->
-      <site name="screw_site" pos="0 0 0" size="0.002" rgba="1 0 0 1"/>
+      <site name="screw_site" pos="0 0 -0.02" size="0.02" rgba="1 0 0 1"/>
     </body>
     
   </worldbody>
