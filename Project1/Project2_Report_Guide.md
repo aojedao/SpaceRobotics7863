@@ -344,3 +344,5 @@ Focus on **three main contributions**:
 - **References**: Not counted in page limit
 
 **Total Body**: ~1500-1900 words (fits 2-3 pages in IEEE double-column format)
+
+create a new branch called visualizations, and there create a new folder called visualization, there, create a mujoco script where you only spawn the bimanual robot which will be used to take a picture for visualization. Also create another one similar to debug unscrew but the arm and the screw are not moving but static, and there are no spheres for the waypoints, or that highlight the screw, and everything is just static, all that will also be used for graphs. Need to fix the visualization of the box as it looks shifted from the base location, and also maybe design the enclosureof an element in the ISS. maybe do a preplanned trajectory. Also need to get the graphs of the moment reaction in the base, the one from the base was apparently not correct as it should be projecting from the end effector frame to the base frame, so it must not be 0 but a transformation with the rotation matrixes and so
