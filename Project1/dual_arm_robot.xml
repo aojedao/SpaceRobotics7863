@@ -148,13 +148,14 @@
       <inertial mass="50" pos="0 0 0" diaginertia="2.0 1.0 1.5"/>
       <freejoint name="central_freejoint"/>
       
-      <!-- Central box geometry - sized to match arm base footprint -->
-      <!-- Left arm at X=-0.3, Right arm at X=+0.05 -->
-      <!-- Center at X=-0.0625, half-width=0.175 (total=0.35m) -->
-      <geom name="central_box" type="box" size="0.175 0.1 0.1" pos="-0.0625 0 0" material="central_box" class="central_body" mass="30" contype="1" conaffinity="1"/>
+      <!-- Central box geometry - CENTERED at body origin (0, 0, 0) relative to body frame -->
+      <!-- Box sized to span from left arm (-0.3) to right arm (+0.05) = 0.35m total width -->
+      <!-- Size: half-extents (0.175, 0.1, 0.1) gives full dimensions (0.35, 0.2, 0.2) -->
+      <geom name="central_box" type="box" size="0.175 0.1 0.1" pos="0 0 0" material="central_box" class="central_body" mass="30" contype="1" conaffinity="1"/>
       
       <!-- Visual details on central body - COLLISION enabled -->
-      <geom name="top_plate" type="box" size="0.155 0.09 0.01" pos="-0.0625 0 0.11" rgba="0.35 0.35 0.4 1" mass="5" contype="1" conaffinity="1"/>
+      <!-- Top plate aligned with box center -->
+      <geom name="top_plate" type="box" size="0.155 0.09 0.01" pos="0 0 0.11" rgba="0.35 0.35 0.4 1" mass="5" contype="1" conaffinity="1"/>
       
       <!-- ============================================== -->
       <!-- LEFT ARM (Arm 1) - Mounted on LEFT END of box (negative X) -->
