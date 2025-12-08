@@ -332,8 +332,8 @@ class PathPlanner:
         pos = state.position
         
         # IMPROVED HEURISTIC: Account for wall transitions
-        # If walls are different, add penalty
-        current_wall = WallPositionMapper().get_wall_from_position(pos)
+        # Use cached mapper instead of creating new one each time
+        current_wall = self.mapper.get_wall_from_position(pos)
         # Note: goal_pos is just xyz, need to infer wall or pass it. 
         # For now, simplistic Euclidean distance.
         
@@ -389,7 +389,27 @@ class PathPlanner:
             # Check if goal reached
             if self.mapper.get_distance(current.state.position, goal_pos) < 0.3:
                 print(f"  Path found in {iterations} iterations!")
-                return self._reconstruct_path(current)
+                path = self._reconstruct_path(current)
+                
+                # ENSURE the EXACT goal position is the final waypoint
+                # This is critical for the screw alignment phase
+                final_wp = path[-1] if path else None
+                if final_wp:
+                    goal_dist = self.mapper.get_distance(final_wp.position, goal_pos)
+                    if goal_dist > 0.05:  # If final WP is more than 5cm from goal
+                        # Add goal as final waypoint
+                        # Alternate arm from the previous waypoint
+                        prev_arm = final_wp.active_arm
+                        goal_arm = 'right' if prev_arm == 'left' else 'left'
+                        goal_state = CrawlerState(
+                            position=goal_pos,
+                            wall=goal_wall,
+                            active_arm=goal_arm
+                        )
+                        path.append(goal_state)
+                        print(f"  ✓ Added goal position as final waypoint (was {goal_dist:.2f}m away)")
+                
+                return path
             
             state_hash = hash(current.state)
             if state_hash in visited:
@@ -541,12 +561,12 @@ class WallCrawlerMuJoCoSimulation:
         self.left_arm_qvel_slice = slice(6, 13)
         self.right_arm_qvel_slice = slice(21, 28)
         
-        # Controller gains - INCREASED for more aggressive motion
-        self.kp_position = 500.0      # Position control (INCREASED from 300)
-        self.kd_position = 40.0       # Damping (slightly higher for stability)
+        # Controller gains - INCREASED for more aggressive motion (FASTER LOCOMOTION)
+        self.kp_position = 900.0      # Position control (INCREASED from 500 for faster reaching)
+        self.kd_position = 25.0       # Damping (REDUCED for faster response)
         self.kp_orientation = 30.0    # Orientation control (INCREASED)
         self.kd_orientation = 20.0
-        self.lambda_dls = 0.008       # Damping for DLS (LOWER for better tracking)
+        self.lambda_dls = 0.006       # Damping for DLS (LOWER for better tracking)
         
         # Per-joint gain multipliers (joints 1-2 are base, need MUCH more authority)
         # [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
@@ -806,65 +826,88 @@ class WallCrawlerMuJoCoSimulation:
         return bias_forces
     
     def _maintain_ee_position_and_orientation(self, arm: str, target_pos: np.ndarray, screw_axis: np.ndarray):
-        """Maintain EE position tracking screw AND strict orientation aligned with screw axis."""
+        """Maintain EE position tracking screw AND strict orientation aligned with screw axis.
+        
+        For position-controlled actuators, we compute the desired joint positions via IK
+        and set them directly to ctrl AND qpos for immediate effect.
+        Returns (position_error_m, orientation_error_rad).
+        """
         if arm == 'left':
             current_pos = self.get_left_gripper_pos()
             current_orient = self.get_left_ee_orientation()
             site_id = self.left_gripper_site_id
             qpos_slice = self.left_arm_qpos_slice
             actuator_slice = self.left_arm_actuator_slice
+            qvel_slice = self.left_arm_qvel_slice
         else:
             current_pos = self.get_right_gripper_pos()
             current_orient = self.get_right_ee_orientation()
             site_id = self.right_gripper_site_id
             qpos_slice = self.right_arm_qpos_slice
             actuator_slice = self.right_arm_actuator_slice
+            qvel_slice = self.right_arm_qvel_slice
         
         # Position error
         pos_error = target_pos - current_pos
-        kp_pos = 150.0  # Reduced gain to prevent instability
+        pos_err_mag = np.linalg.norm(pos_error)
         
         # Orientation error - EE Z-axis should align with NEGATIVE screw axis
         desired_z = -screw_axis  # Gripper Z points into wall
         current_z = current_orient[:, 2]
         orient_error = np.cross(current_z, desired_z)
-        kp_orient = 50.0  # Reduced orientation gain
+        orient_err_mag = np.linalg.norm(orient_error)
+        
+        # Adaptive gains - MUCH HIGHER for effective alignment
+        kp_pos = 80.0 if pos_err_mag > 0.1 else 40.0  # Position gain (INCREASED)
+        kp_orient = 40.0 if orient_err_mag > 0.2 else 20.0  # Orientation gain (INCREASED)
         
         # Get Jacobians
         jacp, jacr = self.compute_jacobian_at_site(site_id)
         if arm == 'left':
-            J_pos = jacp[:, 6:13]
+            J_pos = jacp[:, 6:13]   # Left arm qvel indices 6-12
             J_rot = jacr[:, 6:13]
         else:
-            J_pos = jacp[:, 13:20]
-            J_rot = jacr[:, 13:20]
+            J_pos = jacp[:, 21:28]  # Right arm qvel indices 21-27 (FIXED!)
+            J_rot = jacr[:, 21:28]
         
-        # Stack position and orientation tasks
-        J_full = np.vstack([J_pos * 2.0, J_rot])  # Double weight on position
+        # Stack position and orientation tasks (position has higher priority)
+        J_full = np.vstack([J_pos * 2.0, J_rot])
         task_vel = np.concatenate([kp_pos * pos_error, kp_orient * orient_error])
         
-        # Damped least squares with higher damping for stability
-        lambda_dls = 0.05  # Increased from 0.01 for more stable IK
+        # Damped least squares
+        lambda_dls = 0.01
         JJT = J_full @ J_full.T
         J_pinv = J_full.T @ np.linalg.inv(JJT + lambda_dls**2 * np.eye(6))
         joint_vel = J_pinv @ task_vel
         
-        # Clip joint velocities to prevent instability
-        max_joint_vel = 0.5  # rad/s limit for stability
+        # Integrate to get joint position deltas
+        # Use a fixed integration step that's larger than physics timestep
+        dt = 0.08  # 80ms integration step for faster responsive motion
+        
+        # Clip joint velocities - allow faster motion during alignment
+        max_joint_vel = 2.5  # rad/s (INCREASED)
         joint_vel = np.clip(joint_vel, -max_joint_vel, max_joint_vel)
         
-        # Apply to joints 1-6 only (not J7)
-        # Update BOTH qpos AND ctrl to ensure arm actually moves
-        dt = self.model.opt.timestep
+        # Apply to joints 0-5 only (not J7 which is for rotation)
         for i in range(6):
-            new_q = self.data.qpos[qpos_slice.start + i] + joint_vel[i] * dt
-            # Clamp to joint limits
-            jnt_range = self.model.jnt_range[qpos_slice.start + i]
-            new_q = np.clip(new_q, jnt_range[0] + 0.01, jnt_range[1] - 0.01)
-            self.data.qpos[qpos_slice.start + i] = new_q  # Update position state
-            self.data.ctrl[actuator_slice.start + i] = new_q  # Update control target
+            current_q = self.data.qpos[qpos_slice.start + i]
+            delta_q = joint_vel[i] * dt
+            new_q = current_q + delta_q
+            
+            # NOTE: Joint limits use jnt_range which has different indexing than qpos
+            # For now, use safe conservative limits for KUKA iiwa14 (approximately ±170°)
+            safe_limit = 2.9  # About 166 degrees
+            new_q = np.clip(new_q, -safe_limit, safe_limit)
+            
+            # Set BOTH qpos (state) and ctrl (target) for position actuators
+            self.data.qpos[qpos_slice.start + i] = new_q
+            self.data.ctrl[actuator_slice.start + i] = new_q
         
-        return np.linalg.norm(pos_error), np.linalg.norm(orient_error)
+        # Don't zero velocities - let physics handle it
+        # But do zero the unscrewing arm velocities to prevent drift
+        self.data.qvel[qvel_slice] = 0.0
+        
+        return pos_err_mag, orient_err_mag
     
     def _init_unscrew_task(self, screw_arm: str, anchor_arm: str, screw_wall: str):
         """Initialize the unscrewing task state variables."""
@@ -976,71 +1019,109 @@ class WallCrawlerMuJoCoSimulation:
             ee_pos = self.get_left_gripper_pos()
             qpos_slice = self.left_arm_qpos_slice
             actuator_slice = self.left_arm_actuator_slice
+            qvel_slice = self.left_arm_qvel_slice
         else:
             j7_val = self.data.qpos[self.right_arm_qpos_slice.start + 6]
             ee_pos = self.get_right_gripper_pos()
             qpos_slice = self.right_arm_qpos_slice
             actuator_slice = self.right_arm_actuator_slice
+            qvel_slice = self.right_arm_qvel_slice
         
         self._unscrew_j7_log.append((elapsed, j7_val))
         self._unscrew_ee_pos_log.append((elapsed, ee_pos.copy()))
         self._unscrew_screw_pos_log.append((elapsed, self.data.xpos[self._unscrew_screw_body_id].copy()))
         
-        # Lock body and anchor arm
-        self._lock_all_for_unscrew()
-        
         # ============================================================
-        # ACTIVE ALIGNMENT: Run IK + torque compensation to align EE
+        # DURING ALIGNMENT: Lock body and anchor arm, but allow screw arm to align
         # ============================================================
         
-        # Apply torque compensation for smooth motion
-        self._apply_torque_compensation(self._unscrew_arm)
+        # Lock anchor arm
+        if self._unscrew_anchor_arm == 'left':
+            self.data.qpos[self.left_arm_qpos_slice] = self._unscrew_locked_anchor_joints
+            self.data.qvel[self.left_arm_qvel_slice] = 0.0
+            for i in range(7):
+                self.data.ctrl[self.left_arm_actuator_slice.start + i] = self._unscrew_locked_anchor_joints[i]
+        else:
+            self.data.qpos[self.right_arm_qpos_slice] = self._unscrew_locked_anchor_joints
+            self.data.qvel[self.right_arm_qvel_slice] = 0.0
+            for i in range(7):
+                self.data.ctrl[self.right_arm_actuator_slice.start + i] = self._unscrew_locked_anchor_joints[i]
         
-        # Use IK to maintain position and align orientation with screw axis
+        # Lock body position
+        self.data.qpos[0:3] = self._unscrew_locked_body_pos
+        self.data.qpos[3:7] = self._unscrew_locked_body_quat
+        self.data.qvel[0:6] = 0.0
+        
+        # ============================================================
+        # HOLD CURRENT POSITION: Keep arm at current pose during alignment
+        # IK was causing drift - instead just hold trajectory end pose
+        # ============================================================
+        
         screw_pos = self.data.xpos[self._unscrew_screw_body_id].copy()
-        pos_error, orient_error = self._maintain_ee_position_and_orientation(
-            self._unscrew_arm, 
-            screw_pos,
-            self._unscrew_axis
-        )
+        if self._unscrew_arm == 'left':
+            ee_pos = self.get_left_gripper_pos()
+            current_orient = self.get_left_ee_orientation()
+        else:
+            ee_pos = self.get_right_gripper_pos()
+            current_orient = self.get_right_ee_orientation()
         
-        # Keep J7 at start position during alignment (don't rotate yet)
-        self.data.qpos[qpos_slice.start + 6] = self._unscrew_j7_start
-        self.data.ctrl[actuator_slice.start + 6] = self._unscrew_j7_start
+        pos_error_vec = screw_pos - ee_pos
+        pos_error = np.linalg.norm(pos_error_vec)
         
-        # Print progress periodically
+        # Orientation error
+        desired_z = -self._unscrew_axis
+        current_z = current_orient[:, 2]
+        orient_error = np.arccos(np.clip(np.abs(np.dot(current_z, desired_z)), -1.0, 1.0))
+        
+        # ============================================================
+        # HOLD POSE: Just maintain current joint positions
+        # The trajectory phase should have already positioned the arm correctly
+        # ============================================================
+        current_joints = self.data.qpos[qpos_slice].copy()
+        for i in range(7):
+            self.data.ctrl[actuator_slice.start + i] = current_joints[i]
+        
+        # Track best error for progress monitoring
+        if not hasattr(self, '_align_best_pos_error'):
+            self._align_best_pos_error = pos_error
+            self._align_best_orient_error = orient_error
+        else:
+            self._align_best_pos_error = min(self._align_best_pos_error, pos_error)
+            self._align_best_orient_error = min(self._align_best_orient_error, orient_error)
+        
+        # Print progress every 50 steps (more frequent)
         step_count = int(elapsed / self.model.opt.timestep)
-        if step_count % 100 == 0:
-            error_deg = np.degrees(alignment_error)
-            print(f"  📐 ALIGNING: {elapsed:.2f}s | Error: {error_deg:.1f}° | Pos err: {pos_error*1000:.1f}mm")
+        if step_count % 50 == 0:
+            orient_deg = np.degrees(orient_error)
+            print(f"  📐 ALIGN [{elapsed:.2f}s] Pos: {pos_error*1000:.1f}mm (best:{self._align_best_pos_error*1000:.1f}) | Orient: {orient_deg:.1f}° (best:{np.degrees(self._align_best_orient_error):.1f}°)")
         
         # ============================================================
         # CHECK IF READY TO START ROTATION
         # Must meet BOTH alignment AND position criteria
         # With safety timeout to prevent infinite hanging
         # ============================================================
-        alignment_threshold_deg = 15.0  # Allow up to 15° alignment error
+        alignment_threshold_deg = 20.0  # Allow up to 20° alignment error
         alignment_threshold_rad = np.radians(alignment_threshold_deg)
-        position_threshold_mm = 80.0  # Must be within 80mm of screw
-        min_alignment_time = 0.3  # At least 0.3s of alignment before checking
-        max_alignment_time = 8.0  # Safety timeout after 8 seconds
+        position_threshold_mm = 100.0  # Must be within 100mm of screw
+        min_alignment_time = 0.5  # At least 0.5s of alignment before checking
+        max_alignment_time = 5.0  # Shorter timeout - 5 seconds
         
-        alignment_good = alignment_error < alignment_threshold_rad
+        alignment_good = orient_error < alignment_threshold_rad
         position_good = pos_error * 1000 < position_threshold_mm  # Convert to mm
         time_ok = elapsed >= min_alignment_time
         timed_out = elapsed >= max_alignment_time
         
         # Start when BOTH alignment AND position are good, OR if timed out
         if (alignment_good and position_good and time_ok) or timed_out:
-            error_deg = np.degrees(alignment_error)
+            orient_deg = np.degrees(orient_error)
             if timed_out and not (alignment_good and position_good):
                 print(f"\n  ⚠️ ALIGNMENT TIMEOUT after {elapsed:.1f}s")
-                print(f"     Alignment: {error_deg:.1f}° (threshold: {alignment_threshold_deg}°) {'✓' if alignment_good else '✗'}")
+                print(f"     Orientation: {orient_deg:.1f}° (threshold: {alignment_threshold_deg}°) {'✓' if alignment_good else '✗'}")
                 print(f"     Position: {pos_error*1000:.1f}mm (threshold: {position_threshold_mm}mm) {'✓' if position_good else '✗'}")
                 print(f"     Proceeding to rotation anyway...")
             else:
                 print(f"\n  ✅ ALIGNMENT COMPLETE in {elapsed:.1f}s")
-                print(f"     Final alignment error: {error_deg:.1f}° (threshold: {alignment_threshold_deg}°)")
+                print(f"     Final orientation error: {orient_deg:.1f}° (threshold: {alignment_threshold_deg}°)")
                 print(f"     Position error: {pos_error*1000:.1f}mm (threshold: {position_threshold_mm}mm)")
                 print(f"     Starting rotation phase...")
             
@@ -1221,7 +1302,7 @@ class WallCrawlerMuJoCoSimulation:
             ax4.grid(True, alpha=0.3)
             
             plt.tight_layout()
-            plt.savefig('/home/user/Documents/NYU/SpaceRobotics/SpaceRobotics7863/Project1/unscrew_alignment.png', dpi=150)
+            plt.savefig('/home/aojedao/Documents/NYU/SpaceRobotics/SpaceRobotics7863/Project1/unscrew_alignment.png', dpi=150)
             print(f"\n  📊 Alignment plot saved to: unscrew_alignment.png")
             plt.show(block=False)
             plt.pause(0.5)
@@ -1693,10 +1774,10 @@ class WallCrawlerMuJoCoSimulation:
         else:
             J_base = jacp_full[:, 21:26]  # Right arm joints 0-4 (columns 21-25 in full Jacobian)
         
-        # Very high gains for fast body repositioning
-        kp_coord = 2500.0   # Higher proportional gain for faster response
-        kp_coord = 2500.0   # Higher proportional gain for faster response
-        kd_coord = 20.0     # Moderate damping to prevent oscillation without being sluggish
+        # Very high gains for fast body repositioning - INCREASED FOR FASTER LOCOMOTION
+        kp_coord = 4000.0   # Higher proportional gain for faster response
+        kp_coord = 4000.0   # Higher proportional gain for faster response
+        kd_coord = 15.0     # Lower damping for faster response without being sluggish
         
         # When EE is fixed, body moves opposite to what joint motion would cause EE to move
         # So to move body by +delta, we want joint motion that would move EE by -delta
@@ -2278,10 +2359,10 @@ class WallCrawlerMuJoCoSimulation:
             
             print(f"Body placed at ({body_x:.2f}, {body_y:.2f}, {body_z:.2f})")
         
-        # Initialize arms to neutral
-        safe_arm_pose = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-        self.data.qpos[self.left_arm_qpos_slice] = safe_arm_pose.copy()
-        self.data.qpos[self.right_arm_qpos_slice] = safe_arm_pose.copy()
+        # Initialize arms to COMPACT pose (same as main)
+        compact_arm_pose = np.array([0.0, -1.2, 0.0, 1.8, 0.0, 0.5, 0.0])
+        self.data.qpos[self.left_arm_qpos_slice] = compact_arm_pose.copy()
+        self.data.qpos[self.right_arm_qpos_slice] = compact_arm_pose.copy()
         self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
         
@@ -2566,6 +2647,38 @@ class WallCrawlerMuJoCoSimulation:
             mujoco.mj_forward(self.model, self.data)
             
             # ================================================================
+            # VERIFY ARMS ARE INSIDE MODULE BOUNDS
+            # If any arm is outside, reset to compact pose
+            # ================================================================
+            left_ee = self.get_left_gripper_pos()
+            right_ee = self.get_right_gripper_pos()
+            
+            def is_inside_bounds(pos):
+                margin = 0.05  # 5cm margin for safety
+                return (ISS_MODULE['x_min'] + margin <= pos[0] <= ISS_MODULE['x_max'] - margin and
+                        ISS_MODULE['y_min'] + margin <= pos[1] <= ISS_MODULE['y_max'] - margin and
+                        ISS_MODULE['z_min'] + margin <= pos[2] <= ISS_MODULE['z_max'] - margin)
+            
+            if not is_inside_bounds(left_ee) or not is_inside_bounds(right_ee):
+                print(f"\n⚠️ ARM OUTSIDE BOUNDS - Resetting to compact pose!")
+                print(f"   Left EE: ({left_ee[0]:.2f}, {left_ee[1]:.2f}, {left_ee[2]:.2f})")
+                print(f"   Right EE: ({right_ee[0]:.2f}, {right_ee[1]:.2f}, {right_ee[2]:.2f})")
+                
+                # Force compact pose for both arms
+                compact_arm_pose = np.array([0.0, -1.2, 0.0, 1.8, 0.0, 0.5, 0.0])
+                self.data.qpos[self.left_arm_qpos_slice] = compact_arm_pose.copy()
+                self.data.qpos[self.right_arm_qpos_slice] = compact_arm_pose.copy()
+                mujoco.mj_forward(self.model, self.data)
+                
+                # Verify again
+                left_ee = self.get_left_gripper_pos()
+                right_ee = self.get_right_gripper_pos()
+                print(f"   After reset - Left EE: ({left_ee[0]:.2f}, {left_ee[1]:.2f}, {left_ee[2]:.2f})")
+                print(f"   After reset - Right EE: ({right_ee[0]:.2f}, {right_ee[1]:.2f}, {right_ee[2]:.2f})")
+            else:
+                print(f"✓ Both arms inside module bounds")
+            
+            # ================================================================
             # Set left arm as ALREADY ANCHORED at start position
             # ================================================================
             if self.start_position:
@@ -2583,7 +2696,7 @@ class WallCrawlerMuJoCoSimulation:
             # ================================================================
             # FULL TRAJECTORY LOCOMOTION STATE MACHINE
             # ================================================================
-            settling_timeout = 3000    # Max steps per waypoint
+            settling_timeout = 5000    # Max steps per waypoint (increased for more reliable convergence)
             crawl_phase = 'reaching_anchor'
             phase_timer = 0
             best_error = float('inf')
@@ -2916,11 +3029,6 @@ class WallCrawlerMuJoCoSimulation:
                         # This helps the robot get into position for the first grab
                         body_pos = self.get_central_body_pos()
                         body_to_target = current_target - body_pos
-                        
-                        # INVERT X-AXIS: Change direction of body movement along X
-                        # This flips the robot's preferred movement direction
-                        body_to_target[0] = -body_to_target[0]
-                        
                         body_distance = np.linalg.norm(body_to_target)
                         
                         # Apply body force to move toward target - moderate for smooth motion
@@ -2959,7 +3067,7 @@ class WallCrawlerMuJoCoSimulation:
                                 body_pos = self.get_central_body_pos()
                                 print(f"  [{phase_timer:4d}] Left→WP1 | Error: {left_error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
                             
-                            # Success - anchored at first waypoint (relaxed threshold for reliability)
+                            # Success - anchored at first waypoint (STRICT threshold - DO NOT RELAX)
                             if left_error < 0.10:
                                 left_pos = self.get_left_gripper_pos()
                                 print(f"\n✅ WP{current_waypoint_idx+1} REACHED by LEFT arm! Error: {left_error:.3f}m")
@@ -3038,8 +3146,8 @@ class WallCrawlerMuJoCoSimulation:
                                 error = self.apply_arm_control('left')
                             arm_pos = self.get_left_gripper_pos()
                             
-                            # Use coordinated control when arm error > 0.15m to help body reposition
-                            if error > 0.15 and anchored_arm == 'right' and self.right_anchor_position is not None:
+                            # Use coordinated control ALWAYS to help body reposition faster
+                            if anchored_arm == 'right' and self.right_anchor_position is not None:
                                 self.apply_coordinated_arm_control('right', current_target, self.right_anchor_position)
                         else:
                             self.right_target_position = current_target.copy()  # Re-set after anchor overwrote
@@ -3049,8 +3157,8 @@ class WallCrawlerMuJoCoSimulation:
                                 error = self.apply_arm_control('right')
                             arm_pos = self.get_right_gripper_pos()
                             
-                            # Use coordinated control when arm error > 0.15m to help body reposition
-                            if error > 0.15 and anchored_arm == 'left' and self.left_anchor_position is not None:
+                            # Use coordinated control ALWAYS to help body reposition faster
+                            if anchored_arm == 'left' and self.left_anchor_position is not None:
                                 self.apply_coordinated_arm_control('left', current_target, self.left_anchor_position)
                         
                         # Track trajectory error for plotting
@@ -3079,11 +3187,11 @@ class WallCrawlerMuJoCoSimulation:
                             body_to_mid = midpoint - body_pos
                             mid_distance = np.linalg.norm(body_to_mid)
                             
-                            # Moderate force - don't pull anchor off wall
+                            # INCREASED force for faster locomotion
                             if mid_distance > 0.05:
                                 body_vel = self.data.qvel[0:3]
-                                body_kp = 350.0  # REDUCED from 600 to prevent anchor drift
-                                body_kd = 80.0   # Higher damping for stability
+                                body_kp = 700.0  # INCREASED from 350 for faster body repositioning
+                                body_kd = 60.0   # Moderate damping for stability
                                 body_force = body_kp * body_to_mid - body_kd * body_vel
                                 self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
                         
@@ -3254,13 +3362,10 @@ class WallCrawlerMuJoCoSimulation:
                             print(f"  [{phase_timer:4d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){suffix}")
                         
                         # Success - reached waypoint (must be close to target sphere)
-                        # Use STRICT thresholds - no fake reaching allowed
-                        # Use STRICT thresholds - no fake reaching allowed
-                        # Relaxed threshold to 0.20m to allow completion when arm is close but not exact
+                        # STRICT THRESHOLDS - DO NOT RELAX
                         is_final_waypoint = current_waypoint_idx == total_waypoints - 1
-                        success_threshold = 0.20 if is_final_waypoint else 0.22  # 20cm for final, 22cm for intermediate
-                        
-                        # NO FORCED ACCEPTANCE - Only genuine reaching counts
+                        # Use strict thresholds - arm must actually reach the waypoint
+                        success_threshold = 0.10  # 10cm for ALL waypoints - NO RELAXATION
                         
                         should_accept = error < success_threshold
                         
@@ -3958,18 +4063,42 @@ def main():
         
         sim.set_start_and_goal(start_pos, goal_pos)
         
-        # FORCE SAFE SPAWN POSE
-        # Reset arms to a "Neutral/Ready" pose to avoid initial self-collision/tangling
-        # Pose: Shoulder 0.0 (Neutral), Elbow 1.0 (Slight Bend)
-        # Avoid extreme retraction (-1.0) at spawn to prevent wall clipping
-        safe_arm_pose = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-        sim.data.qpos[sim.left_arm_qpos_slice] = safe_arm_pose.copy()
-        sim.data.qpos[sim.right_arm_qpos_slice] = safe_arm_pose.copy()
+        # FORCE SAFE SPAWN POSE - COMPACT CONFIGURATION
+        # Reset arms to a "Compact/Tucked" pose to GUARANTEE arms stay inside module bounds
+        # KUKA iiwa14 joints: [J1_rotation, J2_shoulder, J3_elbow_rot, J4_elbow, J5_wrist_rot, J6_wrist, J7_flange]
+        # This pose folds the arms close to the body:
+        #   J2 = -1.2 rad: Shoulder retracted (arm points more upward/inward)
+        #   J4 = 1.8 rad: Elbow bent strongly (forearm folds back)
+        #   J6 = 0.5 rad: Wrist bent slightly to keep gripper away from body
+        compact_arm_pose = np.array([0.0, -1.2, 0.0, 1.8, 0.0, 0.5, 0.0])
+        sim.data.qpos[sim.left_arm_qpos_slice] = compact_arm_pose.copy()
+        sim.data.qpos[sim.right_arm_qpos_slice] = compact_arm_pose.copy()
         # Reset velocities
         sim.data.qvel[:] = 0.0
         # Forward kinematics
         mujoco.mj_forward(sim.model, sim.data)
-        print("✓ Reset arms to Safe Neutral Pose (Shoulder 0.0, Elbow 1.0)")
+        print("✓ Reset arms to COMPACT Tucked Pose (J2=-1.2, J4=1.8, J6=0.5)")
+        
+        # Verify arms are inside bounds
+        left_ee = sim.get_left_gripper_pos()
+        right_ee = sim.get_right_gripper_pos()
+        body_pos = sim.get_central_body_pos()
+        print(f"  Body at: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+        print(f"  Left EE at: ({left_ee[0]:.2f}, {left_ee[1]:.2f}, {left_ee[2]:.2f})")
+        print(f"  Right EE at: ({right_ee[0]:.2f}, {right_ee[1]:.2f}, {right_ee[2]:.2f})")
+        
+        # Check bounds
+        def check_in_bounds(pos, name):
+            in_x = ISS_MODULE['x_min'] <= pos[0] <= ISS_MODULE['x_max']
+            in_y = ISS_MODULE['y_min'] <= pos[1] <= ISS_MODULE['y_max']
+            in_z = ISS_MODULE['z_min'] <= pos[2] <= ISS_MODULE['z_max']
+            if in_x and in_y and in_z:
+                print(f"  ✓ {name} inside module bounds")
+            else:
+                print(f"  ⚠️ {name} OUTSIDE bounds! X:{in_x}, Y:{in_y}, Z:{in_z}")
+        
+        check_in_bounds(left_ee, "Left EE")
+        check_in_bounds(right_ee, "Right EE")
         
         # Run visualization or headless simulation
         if headless:
