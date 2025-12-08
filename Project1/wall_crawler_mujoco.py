@@ -850,11 +850,12 @@ class WallCrawlerMuJoCoSimulation:
         joint_vel = J_pinv @ task_vel
         
         # Apply to joints 1-6 only (not J7)
-        current_q = self.data.qpos[qpos_slice].copy()
+        # Update BOTH qpos AND ctrl to ensure arm actually moves
         dt = self.model.opt.timestep
         for i in range(6):
-            current_q[i] += joint_vel[i] * dt
-            self.data.ctrl[actuator_slice.start + i] = current_q[i]
+            new_q = self.data.qpos[qpos_slice.start + i] + joint_vel[i] * dt
+            self.data.qpos[qpos_slice.start + i] = new_q  # Update position state
+            self.data.ctrl[actuator_slice.start + i] = new_q  # Update control target
         
         return np.linalg.norm(pos_error), np.linalg.norm(orient_error)
     
@@ -1008,26 +1009,32 @@ class WallCrawlerMuJoCoSimulation:
         
         # ============================================================
         # CHECK IF READY TO START ROTATION
-        # Conditions: alignment error < threshold OR max time reached
+        # Must meet BOTH alignment AND position criteria
+        # With safety timeout to prevent infinite hanging
         # ============================================================
-        alignment_threshold_deg = 15.0  # Start rotation when < 15° error
+        alignment_threshold_deg = 15.0  # Allow up to 15° alignment error
         alignment_threshold_rad = np.radians(alignment_threshold_deg)
-        min_alignment_time = 0.5  # At least 0.5s of alignment before checking
-        max_alignment_time = 3.0  # Max 3s of alignment, then start anyway
+        position_threshold_mm = 80.0  # Must be within 80mm of screw
+        min_alignment_time = 0.3  # At least 0.3s of alignment before checking
+        max_alignment_time = 8.0  # Safety timeout after 8 seconds
         
         alignment_good = alignment_error < alignment_threshold_rad
+        position_good = pos_error * 1000 < position_threshold_mm  # Convert to mm
         time_ok = elapsed >= min_alignment_time
         timed_out = elapsed >= max_alignment_time
         
-        if (alignment_good and time_ok) or timed_out:
+        # Start when BOTH alignment AND position are good, OR if timed out
+        if (alignment_good and position_good and time_ok) or timed_out:
             error_deg = np.degrees(alignment_error)
-            if timed_out and not alignment_good:
+            if timed_out and not (alignment_good and position_good):
                 print(f"\n  ⚠️ ALIGNMENT TIMEOUT after {elapsed:.1f}s")
-                print(f"     Alignment error: {error_deg:.1f}° (threshold: {alignment_threshold_deg}°)")
-                print(f"     Starting rotation anyway...")
+                print(f"     Alignment: {error_deg:.1f}° (threshold: {alignment_threshold_deg}°) {'✓' if alignment_good else '✗'}")
+                print(f"     Position: {pos_error*1000:.1f}mm (threshold: {position_threshold_mm}mm) {'✓' if position_good else '✗'}")
+                print(f"     Proceeding to rotation anyway...")
             else:
                 print(f"\n  ✅ ALIGNMENT COMPLETE in {elapsed:.1f}s")
-                print(f"     Final alignment error: {error_deg:.1f}°")
+                print(f"     Final alignment error: {error_deg:.1f}° (threshold: {alignment_threshold_deg}°)")
+                print(f"     Position error: {pos_error*1000:.1f}mm (threshold: {position_threshold_mm}mm)")
                 print(f"     Starting rotation phase...")
             
             # Store locked joint positions for rotation phase
@@ -1080,6 +1087,9 @@ class WallCrawlerMuJoCoSimulation:
         else:
             qpos_slice = self.right_arm_qpos_slice
             actuator_slice = self.right_arm_actuator_slice
+        
+        # Apply torque compensation for smooth motion during rotation
+        self._apply_torque_compensation(self._unscrew_arm)
         
         # Calculate rotation increment
         rotation_inc = self._unscrew_speed * self.model.opt.timestep
@@ -2132,6 +2142,11 @@ class WallCrawlerMuJoCoSimulation:
             
             # Get current waypoint index (use class attribute if available)
             current_wp_idx = getattr(self, '_current_waypoint_display_idx', 0)
+            total_waypoints = len(self.current_path)
+            
+            # Check if at final waypoint AND trajectory complete (for hiding markers)
+            is_final_and_arrived = (current_wp_idx >= total_waypoints - 1 and 
+                                   getattr(self, '_trajectory_complete', False))
             
             # Draw all waypoints with numbers
             for i, wp in enumerate(self.current_path):
@@ -2140,7 +2155,9 @@ class WallCrawlerMuJoCoSimulation:
                     color = COMPLETED_WP
                     size = 0.06
                 elif i == current_wp_idx:
-                    # Current target
+                    # Current target - SKIP drawing if at final waypoint and arrived
+                    if is_final_and_arrived:
+                        continue  # Skip yellow marker at final waypoint once arrived
                     color = CURRENT_WP
                     size = 0.10
                 else:
@@ -2166,29 +2183,40 @@ class WallCrawlerMuJoCoSimulation:
                 self._add_line_geom(scene, wp1.position, wp2.position, 
                                    size=line_width, rgba=line_color)
         
-        # 6. Draw current arm targets with highlights
-        # Use SMALL transparent markers so screw is visible through them
-        if self.left_target_position is not None:
-            # Small transparent ring instead of solid sphere (so screw shows through)
-            YELLOW_TRANSPARENT = (1.0, 1.0, 0.0, 0.25)  # Very transparent
-            self._add_marker_geom(scene, tuple(self.left_target_position), size=0.15, rgba=YELLOW_TRANSPARENT)
+        # Check if we're at the final waypoint (for hiding markers during screw animation)
+        is_final_waypoint = False
+        if self.current_path and len(self.current_path) > 0:
+            current_wp_idx = getattr(self, '_current_waypoint_display_idx', 0)
+            total_waypoints = len(self.current_path)
+            is_final_waypoint = current_wp_idx >= total_waypoints - 1
         
-        if self.right_target_position is not None:
-            # Transparent orange for second target
-            ORANGE_TRANSPARENT = (1.0, 0.6, 0.0, 0.25)
-            self._add_marker_geom(scene, tuple(self.right_target_position), size=0.12, rgba=ORANGE_TRANSPARENT)
+        # 6. Draw current arm targets with highlights (HIDE at final waypoint to see screw animation)
+        if not is_final_waypoint:
+            # Use SMALL transparent markers so screw is visible through them
+            if self.left_target_position is not None:
+                # Small transparent ring instead of solid sphere (so screw shows through)
+                YELLOW_TRANSPARENT = (1.0, 1.0, 0.0, 0.25)  # Very transparent
+                self._add_marker_geom(scene, tuple(self.left_target_position), size=0.15, rgba=YELLOW_TRANSPARENT)
+            
+            if self.right_target_position is not None:
+                # Transparent orange for second target
+                ORANGE_TRANSPARENT = (1.0, 0.6, 0.0, 0.25)
+                self._add_marker_geom(scene, tuple(self.right_target_position), size=0.12, rgba=ORANGE_TRANSPARENT)
         
         # 7. Draw trajectory line between anchors (BLUE line from left anchor to right target)
-        if self.left_anchor_position is not None and self.right_target_position is not None:
-            BRIGHT_BLUE = (0.2, 0.6, 1.0, 0.9)
-            self._add_line_geom(scene, 
-                               tuple(self.left_anchor_position), 
-                               tuple(self.right_target_position), 
-                               size=0.02,
-                               rgba=BRIGHT_BLUE)
+        # Also hide at final waypoint
+        if not is_final_waypoint:
+            if self.left_anchor_position is not None and self.right_target_position is not None:
+                BRIGHT_BLUE = (0.2, 0.6, 1.0, 0.9)
+                self._add_line_geom(scene, 
+                                   tuple(self.left_anchor_position), 
+                                   tuple(self.right_target_position), 
+                                   size=0.02,
+                                   rgba=BRIGHT_BLUE)
         
-        # 8. Draw SCREW MARKER - big bright sphere at screw location
-        if getattr(self, '_screw_spawned', False):
+        # 8. Draw SCREW MARKER (HIDE at final waypoint to see screw+arm animation clearly)
+        # Only show during approach, not during unscrew animation
+        if getattr(self, '_screw_spawned', False) and not is_final_waypoint:
             screw_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "screw")
             if screw_body_id != -1:
                 screw_pos = self.data.xpos[screw_body_id]
@@ -2963,6 +2991,7 @@ class WallCrawlerMuJoCoSimulation:
                                     print(f"  ➡️  Right arm moving to WP{current_waypoint_idx+1}")
                                 else:
                                     crawl_phase = 'trajectory_complete'
+                                    self._trajectory_complete = True  # Flag for visualization
                                     print(f"\n🎉 TRAJECTORY COMPLETE!")
                         
                         if phase_timer >= settling_timeout:
@@ -3301,6 +3330,7 @@ class WallCrawlerMuJoCoSimulation:
                                     print(f"  🔓 RIGHT arm RELEASED (now FREE for screw task)")
                                 
                                 crawl_phase = 'trajectory_complete'
+                                self._trajectory_complete = True  # Flag for visualization
                                 print(f"\n🎉 TRAJECTORY COMPLETE!")
                                 print(f"  Final position on {current_target_wall} wall")
                                 body_pos = self.get_central_body_pos()
