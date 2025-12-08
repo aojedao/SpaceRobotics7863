@@ -162,7 +162,7 @@
       <!-- Position: X=-0.3, rotated to point OUTWARD in -X direction -->
       <!-- euler="0 -1.5708 0" rotates arm to point along -X axis -->
       <!-- ============================================== -->
-      <body name="left_arm_base" pos="-0.3 0 0" euler="0 -1.5708 0" childclass="iiwa">
+      <body name="left_arm_base" pos="-0.175 0 0" euler="0 -1.5708 0" childclass="iiwa">
         <inertial mass="5" pos="-0.1 0 0.07" diaginertia="0.05 0.06 0.03"/>
         <geom class="visual" mesh="link_0"/>
         <geom class="collision" size="0.12" pos="0 0 0.03"/>
@@ -355,7 +355,7 @@
       <!-- euler="0 1.5708 0" rotates arm to point along +X axis -->
       <!-- RIGHT ARM MOUNT (X-axis end, pointing +X) -->
       <!-- Offset: +0.2 (half length) -->
-      <body name="right_arm_base" pos="0.05 0 0" euler="0 1.5708 0" childclass="iiwa">
+      <body name="right_arm_base" pos="0.175 0 0" euler="0 1.5708 0" childclass="iiwa">
         <geom name="right_base_geom" type="cylinder" size="0.08 0.04" rgba="0.2 0.2 0.2 1"/>
         <!-- KUKA IIWA 14 - RIGHT ARM -->
         <inertial mass="5" pos="-0.1 0 0.07" diaginertia="0.05 0.06 0.03"/>

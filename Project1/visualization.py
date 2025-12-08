@@ -453,6 +453,82 @@ class PlotGenerator:
             import traceback
             traceback.print_exc()
     
+    def generate_dynamics_plot(self, dynamics_history: Dict,
+                               success: bool,
+                               save_path: str = "dynamics_analysis.png"):
+        """Generate dynamics analysis plot (Anchor Forces & Body Torques).
+        
+        Args:
+            dynamics_history: Dictionary with time_steps, anchor_forces, etc.
+            success: Whether trajectory completed successfully
+            save_path: Path to save the plot
+        """
+        if not dynamics_history or len(dynamics_history.get('time_steps', [])) == 0:
+            print("\n⚠️ No dynamics data collected - skipping dynamics plot")
+            return
+            
+        try:
+            plt = self._setup_matplotlib()
+            
+            print("\n📈 GENERATING DYNAMICS ANALYSIS GRAPH...")
+            
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            
+            time_steps = np.array(dynamics_history['time_steps'])
+            forces = np.array(dynamics_history['anchor_forces'])
+            torques = np.array(dynamics_history['body_torques'])
+            arms = np.array(dynamics_history['anchor_arm'])
+            
+            # 1. Anchor Forces
+            # Split by arm for coloring
+            left_mask = arms == 'left'
+            right_mask = arms == 'right'
+            none_mask = arms == 'none'
+            
+            # Scatter plot is better for switching conditions
+            if np.any(left_mask):
+                ax1.scatter(time_steps[left_mask], forces[left_mask], 
+                           label='Left Arm Anchor', color='#2196F3', s=10, alpha=0.6)
+            if np.any(right_mask):
+                ax1.scatter(time_steps[right_mask], forces[right_mask], 
+                           label='Right Arm Anchor', color='#FF9800', s=10, alpha=0.6)
+            
+            # Also plot line for continuity
+            ax1.plot(time_steps, forces, color='gray', alpha=0.3, linewidth=0.5)
+            
+            ax1.set_ylabel('Anchor Force (N)', fontsize=12)
+            ax1.set_title('Anchor Point Reaction Forces', fontsize=14, fontweight='bold')
+            ax1.legend(loc='upper right')
+            ax1.grid(True, alpha=0.3)
+            
+            # Highlight high force events
+            max_force = np.max(forces) if len(forces) > 0 else 0
+            ax1.set_ylim(0, max(100.0, max_force * 1.1))
+            
+            # 2. Body Torque
+            ax2.plot(time_steps, torques, color='purple', label='Body Orientation Torque (Z)', linewidth=1.0)
+            ax2.set_xlabel('Simulation Time (s)', fontsize=12)
+            ax2.set_ylabel('Torque (Nm)', fontsize=12)
+            ax2.set_title('Central Body Corrective Torque (Yaw)', fontsize=14, fontweight='bold')
+            ax2.axhline(y=0, color='black', alpha=0.3, linestyle='-')
+            ax2.legend(loc='upper right')
+            ax2.grid(True, alpha=0.3)
+            
+            status = 'SUCCESS' if success else 'INCOMPLETE'
+            plt.suptitle(f"Robot Dynamics Analysis - {status}", 
+                        fontsize=16, fontweight='bold', y=0.95)
+            plt.tight_layout()
+            
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"📊 Dynamics plot saved to: {save_path}")
+            
+            self._show_with_timeout(plt)
+            
+        except Exception as e:
+            print(f"\n⚠️ Error creating dynamics plot: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _show_with_timeout(self, plt):
         """Show plot with timeout then close"""
         print(f"   Displaying graph window (auto-closes in {self.plot_timeout} seconds)...")

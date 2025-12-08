@@ -27,18 +27,22 @@ def main():
     model.opt.gravity[:] = [0, 0, 0]
     
     # Set robot to a neutral, photogenic pose with mid-range joints
-    # All joints at 0 (middle of range: J1,J3,J5,J7: ±2.97 rad, J2,J4,J6: ±2.09 rad)
-    neutral_pose = np.zeros(7)
+    # All joints at 0 would be straight. We want them bent.
+    # [J1, J2(shoulder), J3, J4(elbow), J5, J6(wrist), J7]
+    neutral_pose = np.array([0.0, 0.4, 0.0, -1.5, 0.0, 0.5, 0.0])
     
     # Left arm - neutral pose
     left_arm_pose = neutral_pose.copy()
     
-    # Right arm - neutral pose
+    # Right arm - neutral pose, but rotated 180 degrees (pi) on J1 as requested
     right_arm_pose = neutral_pose.copy()
+    right_arm_pose[0] += np.pi
     
     # Find arm joint indices
-    left_arm_start = 7  # After base (7 DOF: 3 pos + 4 quat)
-    right_arm_start = 14  # After base + left arm
+    # NOTE: Right arm starts at 22 (after 7 base + 7 left arm + 8 left gripper joints?)
+    # or just based on XML, it is 22.
+    left_arm_start = 7
+    right_arm_start = 22
     
     # Set arm poses
     data.qpos[left_arm_start:left_arm_start+7] = left_arm_pose
@@ -47,8 +51,8 @@ def main():
     # Set base position inside ISS box (center of workspace)
     # ISS module bounds: x=[-2.1, 3.9], y=[-0.5, 1.7], z=[0.1, 2.2]
     data.qpos[0:3] = [0.9, 0.6, 1.15]  # Center position
-    # Quaternion for 90° Y rotation: [cos(45°), 0, sin(45°), 0] = [0.707, 0, 0.707, 0]
-    data.qpos[3:7] = [0.707, 0.0, 0.707, 0.0]
+    # Quaternion for flat orientation: Identity [1, 0, 0, 0]
+    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
     
     # Forward kinematics to compute positions
     mujoco.mj_forward(model, data)

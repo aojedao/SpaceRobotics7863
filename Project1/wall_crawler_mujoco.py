@@ -2659,762 +2659,801 @@ class WallCrawlerMuJoCoSimulation:
                 'arm': [],
                 'phase': []
             }
+            # NEW: Dynamics tracking
+            dynamics_history = {
+                'time_steps': [],
+                'anchor_forces': [],      # List of force_mag
+                'body_torques': [],       # List of torque_z
+                'anchor_arm': []          # Which arm was anchored
+            }
+            
             global_step = 0  # Track total steps for trajectory plotting
             
-            while viewer.is_running():
-                step_start = time.time()
-                
-                # ============================================================
-                # Apply body damping (always, since body is free from start)
-                # ============================================================
-                body_damping = 5.0
-                self.data.qvel[0:6] *= (1.0 - body_damping * self.model.opt.timestep)
-                
-                # Clear body force/torque at start of each step
-                self.data.xfrc_applied[self.central_body_id, :] = 0
-                
-                # ============================================================
-                # BODY ORIENTATION CONTROL - Keep body aimed at ISS center
-                # ============================================================
-                # ISS module center (approximately)
-                iss_center = np.array([0.9, 0.6, 1.15])
-                body_pos = self.get_central_body_pos()
-                
-                # Get current body orientation (quaternion)
-                body_quat = self.data.qpos[3:7].copy()
-                
-                # Desired orientation: body Y-axis (front) points toward ISS center
-                to_center = iss_center - body_pos
-                to_center_horiz = np.array([to_center[0], to_center[1], 0.0])
-                horiz_dist = np.linalg.norm(to_center_horiz)
-                
-                if horiz_dist > 0.1:
-                    # Compute desired yaw angle (rotation around Z)
-                    desired_yaw = np.arctan2(to_center_horiz[1], to_center_horiz[0])
+            try:
+                while viewer.is_running():
+                    step_start = time.time()
                     
-                    # Current yaw from quaternion
-                    # Extract yaw from quaternion (rotation around Z)
-                    w, x, y, z = body_quat
-                    current_yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+                    # ============================================================
+                    # Apply body damping (always, since body is free from start)
+                    # ============================================================
+                    body_damping = 5.0
+                    self.data.qvel[0:6] *= (1.0 - body_damping * self.model.opt.timestep)
                     
-                    # Yaw error
-                    yaw_error = desired_yaw - current_yaw
-                    # Wrap to [-pi, pi]
-                    while yaw_error > np.pi:
-                        yaw_error -= 2*np.pi
-                    while yaw_error < -np.pi:
-                        yaw_error += 2*np.pi
+                    # Clear body force/torque at start of each step
+                    self.data.xfrc_applied[self.central_body_id, :] = 0
                     
-                    # Apply torque to correct orientation (keep box aimed at ISS center)
-                    # Increase stiffness slightly for a firmer heading while keeping damping to avoid oscillation
-                    orientation_stiffness = 60.0
-                    orientation_damping = 18.0
-                    yaw_vel = self.data.qvel[5]  # Angular velocity around Z
+                    # Per-step logging variables
+                    step_anchor_force = 0.0
+                    step_anchor_arm_name = "none"
+                    current_body_torque = 0.0
                     
-                    torque_z = orientation_stiffness * yaw_error - orientation_damping * yaw_vel
-                    # write into moment (z) slot for central body
-                    self.data.xfrc_applied[self.central_body_id, 5] = torque_z
-                
-                # ============================================================
-                # FULL TRAJECTORY STATE MACHINE
-                # ============================================================
-                
-                # Helper function to apply anchor force AND body pull force
-                # IMPROVED: Better damping to reduce vibration
-                def apply_anchor_force(arm, anchor_pos, prev_pos_attr, hard_lock: bool = False):
-                    """Apply anchor force to hold end-effector at position.
+                    # ============================================================
+                    # BODY ORIENTATION CONTROL - Keep body aimed at ISS center
+                    # ============================================================
+                    # ISS module center (approximately)
+                    iss_center = np.array([0.9, 0.6, 1.15])
+                    body_pos = self.get_central_body_pos()
                     
-                    Args:
-                        arm: 'left' or 'right'
-                        anchor_pos: Target anchor position
-                        prev_pos_attr: Attribute name to store previous position
-                        hard_lock: If True, use very aggressive locking (for final position)
-                    """
-                    if arm == 'left':
-                        pos = self.get_left_gripper_pos()
-                        ee_body_id = self.left_ee_body_id
-                        qpos_slice = slice(7, 14)
-                        qvel_slice = slice(6, 13)
-                        ctrl_slice = self.left_arm_actuator_slice
-                    else:
-                        pos = self.get_right_gripper_pos()
-                        ee_body_id = self.right_ee_body_id
-                        qpos_slice = slice(22, 29)
-                        qvel_slice = slice(21, 28)
-                        ctrl_slice = self.right_arm_actuator_slice
+                    # Get current body orientation (quaternion)
+                    body_quat = self.data.qpos[3:7].copy()
                     
-                    err = anchor_pos - pos
-                    err_mag = np.linalg.norm(err)
+                    # Desired orientation: body Y-axis (front) points toward ISS center
+                    to_center = iss_center - body_pos
+                    to_center_horiz = np.array([to_center[0], to_center[1], 0.0])
+                    horiz_dist = np.linalg.norm(to_center_horiz)
                     
-                    # Track previous position for velocity estimation
-                    prev_pos = getattr(self, prev_pos_attr, pos)
-                    vel_approx = (pos - prev_pos) / self.model.opt.timestep
-                    setattr(self, prev_pos_attr, pos.copy())
+                    if horiz_dist > 0.1:
+                        # Compute desired yaw angle (rotation around Z)
+                        desired_yaw = np.arctan2(to_center_horiz[1], to_center_horiz[0])
+                        
+                        # Current yaw from quaternion
+                        # Extract yaw from quaternion (rotation around Z)
+                        w, x, y, z = body_quat
+                        current_yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+                        
+                        # Yaw error
+                        yaw_error = desired_yaw - current_yaw
+                        # Wrap to [-pi, pi]
+                        while yaw_error > np.pi:
+                            yaw_error -= 2*np.pi
+                        while yaw_error < -np.pi:
+                            yaw_error += 2*np.pi
+                        
+                        # Apply torque to correct orientation (keep box aimed at ISS center)
+                        # Increase stiffness slightly for a firmer heading while keeping damping to avoid oscillation
+                        orientation_stiffness = 60.0
+                        orientation_damping = 18.0
+                        yaw_vel = self.data.qvel[5]  # Angular velocity around Z
+                        
+                        torque_z = orientation_stiffness * yaw_error - orientation_damping * yaw_vel
+                        # write into moment (z) slot for central body
+                        self.data.xfrc_applied[self.central_body_id, 5] = torque_z
+                        
+                        # Store for logging
+                        current_body_torque = torque_z
                     
-                    # CRITICAL DAMPING: zeta = 1.0 for no overshoot
-                    # For critically damped system: damping = 2 * sqrt(stiffness * mass)
-                    # Assume effective mass ~5 kg at end-effector
-                    effective_mass = 5.0
+                    # ============================================================
+                    # FULL TRAJECTORY STATE MACHINE
+                    # ============================================================
                     
-                    if hard_lock:
-                        # HARD LOCK MODE: Very high stiffness, critical damping
-                        grip_stiffness = 120000.0  # INCREASED for better anchor hold
-                        grip_damping = 2.0 * np.sqrt(grip_stiffness * effective_mass)  # ~1549
-                        max_force = 80000.0  # INCREASED
-                        velocity_damping_factor = 0.4  # Aggressive velocity kill
-                    else:
-                        # Normal anchoring - still needs to be strong
-                        grip_stiffness = 80000.0  # INCREASED from 50000
-                        grip_damping = 2.0 * np.sqrt(grip_stiffness * effective_mass)  # ~1265
-                        max_force = 40000.0  # INCREASED from 20000
-                        velocity_damping_factor = 0.9  # Gentle damping
-                    
-                    # Spring-damper force with critical damping
-                    force = grip_stiffness * err - grip_damping * vel_approx
-                    force_mag = np.linalg.norm(force)
-                    if force_mag > max_force:
-                        force = force * (max_force / force_mag)
-                    self.data.xfrc_applied[ee_body_id, 0:3] = force
-                    
-                    # Lock arm joints to maintain anchor rigidly
-                    lock_attr = f'_locked_{arm}_joints'
-                    if not hasattr(self, lock_attr) or getattr(self, lock_attr) is None:
-                        # First time - save current joint positions
-                        setattr(self, lock_attr, self.data.qpos[qpos_slice].copy())
-                    
-                    # Apply joint position control to lock the arm
-                    locked_joints = getattr(self, lock_attr)
-                    if locked_joints is not None:
-                        self.data.ctrl[ctrl_slice] = locked_joints
-                        # Damp joint velocities to prevent vibration
-                        self.data.qvel[qvel_slice] *= velocity_damping_factor
+                    # Helper function to apply anchor force AND body pull force
+                    # IMPROVED: Better damping to reduce vibration
+                    def apply_anchor_force(arm, anchor_pos, prev_pos_attr, hard_lock: bool = False):
+                        """Apply anchor force to hold end-effector at position.
+                        
+                        Args:
+                            arm: 'left' or 'right'
+                            anchor_pos: Target anchor position
+                            prev_pos_attr: Attribute name to store previous position
+                            hard_lock: If True, use very aggressive locking (for final position)
+                        """
+                        if arm == 'left':
+                            pos = self.get_left_gripper_pos()
+                            ee_body_id = self.left_ee_body_id
+                            qpos_slice = slice(7, 14)
+                            qvel_slice = slice(6, 13)
+                            ctrl_slice = self.left_arm_actuator_slice
+                        else:
+                            pos = self.get_right_gripper_pos()
+                            ee_body_id = self.right_ee_body_id
+                            qpos_slice = slice(22, 29)
+                            qvel_slice = slice(21, 28)
+                            ctrl_slice = self.right_arm_actuator_slice
+                        
+                        err = anchor_pos - pos
+                        err_mag = np.linalg.norm(err)
+                        
+                        # Track previous position for velocity estimation
+                        prev_pos = getattr(self, prev_pos_attr, pos)
+                        vel_approx = (pos - prev_pos) / self.model.opt.timestep
+                        setattr(self, prev_pos_attr, pos.copy())
+                        
+                        # CRITICAL DAMPING: zeta = 1.0 for no overshoot
+                        # For critically damped system: damping = 2 * sqrt(stiffness * mass)
+                        # Assume effective mass ~5 kg at end-effector
+                        effective_mass = 5.0
                         
                         if hard_lock:
-                            # In hard lock mode, also force-restore joint positions
-                            # This directly overrides any physics drift
-                            joint_error = locked_joints - self.data.qpos[qpos_slice]
-                            if np.linalg.norm(joint_error) > 0.001:
-                                # Blend toward locked position
-                                self.data.qpos[qpos_slice] = self.data.qpos[qpos_slice] + 0.1 * joint_error
-                    
-                    # BODY PULL: Pull body toward MIDPOINT between anchor and where moving arm needs to go
-                    # This helps position the body optimally for the next waypoint
-                    body_pos = self.get_central_body_pos()
-                    
-                    # Get the moving arm's target (if available)
-                    moving_target = None
-                    if arm == 'left' and hasattr(self, 'right_target_position') and self.right_target_position is not None:
-                        moving_target = self.right_target_position
-                    elif arm == 'right' and hasattr(self, 'left_target_position') and self.left_target_position is not None:
-                        moving_target = self.left_target_position
-                    
-                    if moving_target is not None:
-                        # Pull body toward the midpoint between anchor and moving target
-                        midpoint = (anchor_pos + moving_target) / 2.0
-                        body_to_mid = midpoint - body_pos
-                        distance = np.linalg.norm(body_to_mid)
+                            # HARD LOCK MODE: Very high stiffness, critical damping
+                            grip_stiffness = 120000.0  # INCREASED for better anchor hold
+                            grip_damping = 2.0 * np.sqrt(grip_stiffness * effective_mass)  # ~1549
+                            max_force = 80000.0  # INCREASED
+                            velocity_damping_factor = 0.4  # Aggressive velocity kill
+                        else:
+                        # Normal anchoring - increased stiffness for stability
+                            grip_stiffness = 150000.0  # INCREASED from 80000 (User request: increase rigidity)
+                            grip_damping = 2.0 * np.sqrt(grip_stiffness * effective_mass)  # Critical damping ~1732
+                            max_force = 60000.0   # INCREASED
+                            velocity_damping_factor = 0.9  # Gentle damping
                         
-                        # Moderate force for smooth body repositioning
-                        if distance > 0.10:
-                            body_pull_stiffness = 300.0  # Moderate force
-                            body_damping_coef = 40.0     # Good damping
-                            body_vel = self.data.qvel[0:3]
-                            
-                            body_force = body_pull_stiffness * body_to_mid - body_damping_coef * body_vel
-                            self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
-                    else:
-                        # Fall back to original anchor-only pull
-                        body_to_anchor = anchor_pos - body_pos
-                        distance = np.linalg.norm(body_to_anchor)
+                        # Spring-damper force with critical damping
+                        force = grip_stiffness * err - grip_damping * vel_approx
+                        force_mag = np.linalg.norm(force)
+                        if force_mag > max_force:
+                            force = force * (max_force / force_mag)
+                        self.data.xfrc_applied[ee_body_id, 0:3] = force
                         
-                        if distance > 0.4:
-                            body_pull_stiffness = 200.0  # Increased from 100.0
-                            body_damping_coef = 30.0
-                            body_vel = self.data.qvel[0:3]
+                        # Capture force for logging
+                        nonlocal step_anchor_force, step_anchor_arm_name
+                        if force_mag > step_anchor_force:
+                            step_anchor_force = force_mag
+                            step_anchor_arm_name = arm
+                        
+                        # Lock arm joints to maintain anchor rigidly
+                        lock_attr = f'_locked_{arm}_joints'
+                        if not hasattr(self, lock_attr) or getattr(self, lock_attr) is None:
+                            # First time - save current joint positions
+                            setattr(self, lock_attr, self.data.qpos[qpos_slice].copy())
+                        
+                        # Apply joint position control to lock the arm
+                        locked_joints = getattr(self, lock_attr)
+                        if locked_joints is not None:
+                            self.data.ctrl[ctrl_slice] = locked_joints
+                            # Damp joint velocities to prevent vibration
+                            self.data.qvel[qvel_slice] *= velocity_damping_factor
                             
-                            body_force = body_pull_stiffness * body_to_anchor - body_damping_coef * body_vel
-                            self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                            if hard_lock:
+                                # In hard lock mode, also force-restore joint positions
+                                # This directly overrides any physics drift
+                                joint_error = locked_joints - self.data.qpos[qpos_slice]
+                                if np.linalg.norm(joint_error) > 0.001:
+                                    # Blend toward locked position
+                                    self.data.qpos[qpos_slice] = self.data.qpos[qpos_slice] + 0.1 * joint_error
+                        
+                        # BODY PULL: Pull body toward MIDPOINT between anchor and where moving arm needs to go
+                        # This helps position the body optimally for the next waypoint
+                        body_pos = self.get_central_body_pos()
+                        
+                        # Get the moving arm's target (if available)
+                        moving_target = None
+                        if arm == 'left' and hasattr(self, 'right_target_position') and self.right_target_position is not None:
+                            moving_target = self.right_target_position
+                        elif arm == 'right' and hasattr(self, 'left_target_position') and self.left_target_position is not None:
+                            moving_target = self.left_target_position
+                        
+                        if moving_target is not None:
+                            # Pull body toward the midpoint between anchor and moving target
+                            midpoint = (anchor_pos + moving_target) / 2.0
+                            body_to_mid = midpoint - body_pos
+                            distance = np.linalg.norm(body_to_mid)
+                            
+                            # Moderate force for smooth body repositioning
+                            if distance > 0.10:
+                                body_pull_stiffness = 300.0  # Moderate force
+                                body_damping_coef = 40.0     # Good damping
+                                body_vel = self.data.qvel[0:3]
+                                
+                                body_force = body_pull_stiffness * body_to_mid - body_damping_coef * body_vel
+                                self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                        else:
+                            # Fall back to original anchor-only pull
+                            body_to_anchor = anchor_pos - body_pos
+                            distance = np.linalg.norm(body_to_anchor)
+                            
+                            if distance > 0.4:
+                                body_pull_stiffness = 200.0  # Increased from 100.0
+                                body_damping_coef = 30.0
+                                body_vel = self.data.qvel[0:3]
+                                
+                                body_force = body_pull_stiffness * body_to_anchor - body_damping_coef * body_vel
+                                self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                        
+                        # TRACK: Record deviation for anchor statistics
+                        if current_anchor_idx is not None and current_anchor_idx in anchor_deviation_history:
+                            anchor_deviation_history[current_anchor_idx]['deviations'].append(err_mag)
+                            if err_mag > anchor_deviation_history[current_anchor_idx]['max_deviation']:
+                                anchor_deviation_history[current_anchor_idx]['max_deviation'] = err_mag
+                        
+                        return err_mag
                     
-                    # TRACK: Record deviation for anchor statistics
-                    if current_anchor_idx is not None and current_anchor_idx in anchor_deviation_history:
-                        anchor_deviation_history[current_anchor_idx]['deviations'].append(err_mag)
-                        if err_mag > anchor_deviation_history[current_anchor_idx]['max_deviation']:
-                            anchor_deviation_history[current_anchor_idx]['max_deviation'] = err_mag
+                    if crawl_phase == 'reaching_anchor':
+                        # First phase: Left arm reaches first waypoint
+                        phase_timer += 1
+                        global_step += 1
+                        
+                        # Update display index for visualization
+                        self._current_waypoint_display_idx = current_waypoint_idx
+                        
+                        # Keep right arm retracted
+                        self.data.ctrl[self.right_arm_actuator_slice] = self.data.qpos[self.right_arm_qpos_slice]
+                        
+                        # Move body toward first waypoint (before any anchor exists)
+                        # This helps the robot get into position for the first grab
+                        body_pos = self.get_central_body_pos()
+                        body_to_target = current_target - body_pos
+                        
+                        # INVERT X-AXIS: Change direction of body movement along X
+                        # This flips the robot's preferred movement direction
+                        body_to_target[0] = -body_to_target[0]
+                        
+                        body_distance = np.linalg.norm(body_to_target)
+                        
+                        # Apply body force to move toward target - moderate for smooth motion
+                        body_vel = self.data.qvel[0:3]
+                        kp_body = 350.0  # INCREASED: More aggressive repositioning to reach first waypoint
+                        kd_body = 30.0   # Higher damping for stability
+                        body_force = kp_body * body_to_target - kd_body * body_vel
+                        self.data.xfrc_applied[self.central_body_id, 0:3] = body_force
+                        
+                        # Left arm reaches toward first waypoint
+                        if current_target is not None:
+                            self.left_target_position = current_target.copy()
+                            left_error = self.apply_arm_control('left')
+                            
+                            # Track trajectory error for plotting
+                            trajectory_error_history['time_steps'].append(global_step)
+                            trajectory_error_history['errors'].append(left_error)
+                            trajectory_error_history['waypoint_idx'].append(current_waypoint_idx)
+                            trajectory_error_history['arm'].append('left')
+                            trajectory_error_history['phase'].append('reaching_anchor')
+                            
+                            # Apply stabilizing force when close
+                            if left_error < 0.3:
+                                grip_stiffness = 3000.0
+                                left_pos = self.get_left_gripper_pos()
+                                left_err = current_target - left_pos
+                                self.data.xfrc_applied[self.left_ee_body_id, 0:3] = grip_stiffness * left_err
+                            
+                            if left_error < best_error:
+                                best_error = left_error
+                                last_progress_time = time.time()  # Reset progress timer on improvement
+                                last_best_error = left_error
+                            
+                            if phase_timer % 100 == 0:
+                                left_pos = self.get_left_gripper_pos()
+                                body_pos = self.get_central_body_pos()
+                                print(f"  [{phase_timer:4d}] Left→WP1 | Error: {left_error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+                            
+                            # Success - anchored at first waypoint (relaxed threshold for reliability)
+                            if left_error < 0.10:
+                                left_pos = self.get_left_gripper_pos()
+                                print(f"\n✅ WP{current_waypoint_idx+1} REACHED by LEFT arm! Error: {left_error:.3f}m")
+                                
+                                # ANCHOR AT THE VALID SPHERE POSITION (the target waypoint)
+                                anchor_position = np.array(current_target)
+                                self.left_arm_anchored = True
+                                self.left_anchor_position = anchor_position.copy()
+                                print(f"  🔒 LEFT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                                
+                                # Initialize anchor deviation tracking for this waypoint
+                                current_anchor_idx = current_waypoint_idx
+                                anchor_deviation_history[current_anchor_idx] = {
+                                    'anchor_pos': anchor_position.copy(),
+                                    'arm': 'left',
+                                    'max_deviation': 0.0,
+                                    'deviations': []
+                                }
+                                
+                                current_waypoint_idx += 1
+                                
+                                if current_waypoint_idx < total_waypoints:
+                                    # Move to next waypoint with right arm
+                                    current_target = waypoints[current_waypoint_idx]
+                                    current_target_wall = waypoint_walls[current_waypoint_idx]
+                                    is_final = current_waypoint_idx == total_waypoints - 1
+                                    # DISABLED: Orientation control makes final WP harder to reach
+                                    # Position-only control is more reliable
+                                    use_orientation_control = False
+                                    moving_arm = 'right'
+                                    anchored_arm = 'left'
+                                    crawl_phase = 'reaching_waypoint'
+                                    phase_timer = 0
+                                    best_error = float('inf')
+                                    print(f"  🔒 Left arm LOCKED")
+                                    print(f"  ➡️  Right arm moving to WP{current_waypoint_idx+1}")
+                                else:
+                                    crawl_phase = 'trajectory_complete'
+                                    print(f"\n🎉 TRAJECTORY COMPLETE!")
+                        
+                        if phase_timer >= settling_timeout:
+                            print(f"\n⚠️ Timeout reaching WP1")
+                            crawl_phase = 'failed'
                     
-                    return err_mag
-                
-                if crawl_phase == 'reaching_anchor':
-                    # First phase: Left arm reaches first waypoint
-                    phase_timer += 1
-                    global_step += 1
-                    
-                    # Update display index for visualization
-                    self._current_waypoint_display_idx = current_waypoint_idx
-                    
-                    # Keep right arm retracted
-                    self.data.ctrl[self.right_arm_actuator_slice] = self.data.qpos[self.right_arm_qpos_slice]
-                    
-                    # Move body toward first waypoint (before any anchor exists)
-                    # This helps the robot get into position for the first grab
-                    body_pos = self.get_central_body_pos()
-                    body_to_target = current_target - body_pos
-                    
-                    # INVERT X-AXIS: Change direction of body movement along X
-                    # This flips the robot's preferred movement direction
-                    body_to_target[0] = -body_to_target[0]
-                    
-                    body_distance = np.linalg.norm(body_to_target)
-                    
-                    # Apply body force to move toward target - moderate for smooth motion
-                    body_vel = self.data.qvel[0:3]
-                    kp_body = 350.0  # INCREASED: More aggressive repositioning to reach first waypoint
-                    kd_body = 30.0   # Higher damping for stability
-                    body_force = kp_body * body_to_target - kd_body * body_vel
-                    self.data.xfrc_applied[self.central_body_id, 0:3] = body_force
-                    
-                    # Left arm reaches toward first waypoint
-                    if current_target is not None:
-                        self.left_target_position = current_target.copy()
-                        left_error = self.apply_arm_control('left')
+                    elif crawl_phase == 'reaching_waypoint':
+                        # Alternating arm reaches next waypoint
+                        phase_timer += 1
+                        global_step += 1
+                        
+                        # First, set the moving arm's target so body pull knows where to go
+                        if moving_arm == 'left':
+                            self.left_target_position = current_target.copy()
+                        else:
+                            self.right_target_position = current_target.copy()
+                        
+                        # Apply anchor force to the anchored arm (now knows moving target for body pull)
+                        if anchored_arm == 'left' and self.left_anchor_position is not None:
+                            apply_anchor_force('left', self.left_anchor_position, '_prev_left_pos')
+                            self.left_target_position = self.left_anchor_position.copy()
+                            # Only control last 2 joints of anchored arm to maintain anchor
+                            # First 5 joints can be adjusted to help moving arm reach
+                            self.apply_arm_control('left', anchored_mode=True)
+                        elif anchored_arm == 'right' and self.right_anchor_position is not None:
+                            apply_anchor_force('right', self.right_anchor_position, '_prev_right_pos')
+                            self.right_target_position = self.right_anchor_position.copy()
+                            self.apply_arm_control('right', anchored_mode=True)
+                        
+                        # Moving arm reaches toward target
+                        # Also adjust first 5 joints of anchored arm to help body positioning
+                        if moving_arm == 'left':
+                            self.left_target_position = current_target.copy()  # Re-set after anchor overwrote
+                            if use_orientation_control:
+                                error = self.apply_arm_control_with_orientation('left', current_target_wall)
+                            else:
+                                error = self.apply_arm_control('left')
+                            arm_pos = self.get_left_gripper_pos()
+                            
+                            # Use coordinated control when arm error > 0.15m to help body reposition
+                            if error > 0.15 and anchored_arm == 'right' and self.right_anchor_position is not None:
+                                self.apply_coordinated_arm_control('right', current_target, self.right_anchor_position)
+                        else:
+                            self.right_target_position = current_target.copy()  # Re-set after anchor overwrote
+                            if use_orientation_control:
+                                error = self.apply_arm_control_with_orientation('right', current_target_wall)
+                            else:
+                                error = self.apply_arm_control('right')
+                            arm_pos = self.get_right_gripper_pos()
+                            
+                            # Use coordinated control when arm error > 0.15m to help body reposition
+                            if error > 0.15 and anchored_arm == 'left' and self.left_anchor_position is not None:
+                                self.apply_coordinated_arm_control('left', current_target, self.left_anchor_position)
                         
                         # Track trajectory error for plotting
                         trajectory_error_history['time_steps'].append(global_step)
-                        trajectory_error_history['errors'].append(left_error)
+                        trajectory_error_history['errors'].append(error)
                         trajectory_error_history['waypoint_idx'].append(current_waypoint_idx)
-                        trajectory_error_history['arm'].append('left')
-                        trajectory_error_history['phase'].append('reaching_anchor')
+                        trajectory_error_history['arm'].append(moving_arm)
+                        trajectory_error_history['phase'].append('reaching_waypoint')
                         
-                        # Apply stabilizing force when close
-                        if left_error < 0.3:
-                            grip_stiffness = 3000.0
-                            left_pos = self.get_left_gripper_pos()
-                            left_err = current_target - left_pos
-                            self.data.xfrc_applied[self.left_ee_body_id, 0:3] = grip_stiffness * left_err
+                        # Update display index for visualization
+                        self._current_waypoint_display_idx = current_waypoint_idx
                         
-                        if left_error < best_error:
-                            best_error = left_error
-                            last_progress_time = time.time()  # Reset progress timer on improvement
-                            last_best_error = left_error
+                        # ================================================================
+                        # BODY REPOSITIONING - Pull body toward optimal position for reaching
+                        # ================================================================
+                        body_pos = self.get_central_body_pos()
+                        # Get anchor position
+                        if anchored_arm == 'left':
+                            anchor_pos_now = self.left_anchor_position
+                        else:
+                            anchor_pos_now = self.right_anchor_position
+                        
+                        if anchor_pos_now is not None and current_target is not None:
+                            # Midpoint between anchor and target is ideal body position
+                            midpoint = (anchor_pos_now + current_target) / 2.0
+                            body_to_mid = midpoint - body_pos
+                            mid_distance = np.linalg.norm(body_to_mid)
+                            
+                            # Moderate force - don't pull anchor off wall
+                            if mid_distance > 0.05:
+                                body_vel = self.data.qvel[0:3]
+                                body_kp = 350.0  # REDUCED from 600 to prevent anchor drift
+                                body_kd = 80.0   # Higher damping for stability
+                                body_force = body_kp * body_to_mid - body_kd * body_vel
+                                self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
+                        
+                        # ================================================================
+                        # STUCK DETECTION AND RECOVERY SYSTEM
+                        # ================================================================
+                        current_time = time.time()
+                        
+                        # Check if we're in recovery mode
+                        if in_recovery_mode:
+                            recovery_elapsed = current_time - recovery_start_time
+                            
+                            # RECOVERY STRATEGY: Rotate the ANCHORED arm to reposition body
+                            # This helps the moving arm reach its target by changing body position
+                            # FIX: Use anchored_arm instead of moving_arm for recovery rotation
+                            if anchored_arm == 'left':
+                                qpos_slice = self.left_arm_qpos_slice
+                                actuator_slice = self.left_arm_actuator_slice
+                            else:
+                                qpos_slice = self.right_arm_qpos_slice
+                                actuator_slice = self.right_arm_actuator_slice
+                            
+                            # Smoothly rotate joint1 towards target
+                            current_j1 = self.data.qpos[qpos_slice][0]
+                            j1_error = recovery_joint1_target - current_j1
+                            
+                            # Normalize angle error to [-pi, pi]
+                            while j1_error > np.pi:
+                                j1_error -= 2 * np.pi
+                            while j1_error < -np.pi:
+                                j1_error += 2 * np.pi
+                            
+                            # Apply joint1 rotation with optimized gain (faster for intelligent recovery)
+                            # Apply joint1 rotation with optimized gain
+                            j1_velocity = recovery_j1_velocity_gain * j1_error
+                            new_j1 = current_j1 + j1_velocity * self.model.opt.timestep
+                            
+                            # SMART RECOVERY: Also retract shoulder (J2) and bend elbow (J4) to "Turtle" the arm
+                            # This clears the workspace more effectively than just rotating
+                            target_j2 = -1.0
+                            target_j4 = 1.5
+                            
+                            current_j2 = self.data.qpos[qpos_slice][1]
+                            current_j4 = self.data.qpos[qpos_slice][3]
+                            
+                            new_j2 = current_j2 + 2.0 * (target_j2 - current_j2) * self.model.opt.timestep
+                            new_j4 = current_j4 + 2.0 * (target_j4 - current_j4) * self.model.opt.timestep
+                            
+                            # Set commands for Moving Arm
+                            current_cmd = self.data.ctrl[actuator_slice].copy()
+                            current_cmd[0] = new_j1  # Rotate
+                            current_cmd[1] = new_j2  # Retract Shoulder
+                            current_cmd[3] = new_j4  # Bend Elbow
+                            self.data.ctrl[actuator_slice] = current_cmd
+                            
+                            # Apply recovery to Moving Arm too (retract to clear workspace)
+                            # Since we're rotating the anchored arm, also turtle the moving arm
+                            if moving_arm == 'left':
+                                moving_actuator_slice = self.left_arm_actuator_slice
+                                moving_qpos_slice = self.left_arm_qpos_slice
+                            else:
+                                moving_actuator_slice = self.right_arm_actuator_slice
+                                moving_qpos_slice = self.right_arm_qpos_slice
+                                
+                            # Moving Arm Control: Retract J2/J4 to turtle
+                            moving_current_q = self.data.qpos[moving_qpos_slice]
+                            moving_current_j2 = moving_current_q[1]
+                            moving_current_j4 = moving_current_q[3]
+                            
+                            moving_cmd = self.data.ctrl[moving_actuator_slice].copy()
+                            # Retract moving arm to clear workspace (don't rotate J1 - keep trying to reach)
+                            moving_cmd[1] += 2.0 * (target_j2 - moving_current_j2) * self.model.opt.timestep
+                            moving_cmd[3] += 2.0 * (target_j4 - moving_current_j4) * self.model.opt.timestep
+                            
+                            self.data.ctrl[moving_actuator_slice] = moving_cmd
+    
+                            # Damping for other joints (J3, J5, J6, J7) is implicit as we don't actuate them strongly here?
+                            # No, we must ensure they don't drift.
+                            # Actually, keeping previous command for them (via copy) acts as position hold if using position control?
+                            # The actuator is position control. So `current_cmd` holds last commanded value?
+                            # Wait, `self.data.ctrl` persists? Yes.
+                            # So simply updating J1,J2,J4 handles them, others hold.
+                            
+                            if phase_timer % 100 == 0:
+                                print(f"  🔄 RECOVERY [{recovery_attempts}/{max_recovery_attempts}] J1: {np.degrees(current_j1):.1f}° → {np.degrees(recovery_joint1_target):.1f}° | {recovery_duration - recovery_elapsed:.1f}s left")
+                            
+                            # End recovery after duration
+                            if recovery_elapsed >= recovery_duration:
+                                in_recovery_mode = False
+                                best_error = float('inf')  # Reset best error to give fresh start
+                                last_progress_time = current_time  # Reset progress timer
+                                last_best_error = float('inf')
+                                print(f"\n  ✅ Recovery {recovery_attempts} complete - J1 repositioned, resuming control")
+                        else:
+                            # Track if error is improving
+                            if error < last_best_error - stuck_error_improvement_threshold:
+                                last_best_error = error
+                                last_progress_time = current_time
+                            
+                            if error < best_error:
+                                best_error = error
+                                self._stuck_counter = 0
+                            else:
+                                self._stuck_counter += 1
+                            
+                            # Check if stuck (no progress for stuck_detection_threshold seconds)
+                            time_without_progress = current_time - last_progress_time
+                            
+                            if time_without_progress > stuck_detection_threshold and error > 0.12:
+                                if recovery_attempts < max_recovery_attempts:
+                                    max_recovery_attempts = 15  # Increased to allow cycling through all strategies (3 standard + panic) multiple times
+                                    stuck_error_improvement_threshold = 0.001
+                                    stuck_detection_threshold = 5.0 # Check stuck every 5s
+                                    
+                                    recovery_attempts += 1
+                                    in_recovery_mode = True
+                                    recovery_start_time = current_time
+                                    
+                                    # Get current joint1 angle for computing target
+                                    # FIX: Use ANCHORED arm since that's what we're rotating in recovery
+                                    if anchored_arm == 'left':
+                                        current_j1 = self.data.qpos[self.left_arm_qpos_slice][0]
+                                    else:
+                                        current_j1 = self.data.qpos[self.right_arm_qpos_slice][0]
+                                    
+                                    # Recovery strategies: Rotate RELATIVE to current position
+                                    # Each recovery moves the arm a different amount
+                                    recovery_rotation = [np.pi, np.pi/2, -np.pi/2, np.pi*0.75, -np.pi*0.75]
+                                    strategy_idx = (recovery_attempts - 1) % len(recovery_rotation)
+                                    rotation_amount = recovery_rotation[strategy_idx]
+                                    recovery_joint1_target = current_j1 + rotation_amount
+                                    
+                                    # Normalize to [-pi, pi]
+                                    while recovery_joint1_target > np.pi:
+                                        recovery_joint1_target -= 2 * np.pi
+                                    while recovery_joint1_target < -np.pi:
+                                        recovery_joint1_target += 2 * np.pi
+                                    
+                                    # Human-readable strategy names
+                                    strategy_names = ["180° FLIP", "+90° ROTATE", "-90° ROTATE", "+135° ROTATE", "-135° ROTATE"]
+                                    strategy_name = strategy_names[strategy_idx]
+    
+                                    print(f"    - Strategy: {strategy_name}")
+                                    print(f"    - J1: {np.degrees(current_j1):.1f}° → {np.degrees(recovery_joint1_target):.1f}°")
+                                    
+                                    # DUAL-ARM RECOVERY: Apply J1 target to BOTH arms to clear workspace
+                                    # The 'moving_arm' logic below only sets one. We will override both in the loop.
+                                else:
+                                    print(f"\n❌ MAX RECOVERY ATTEMPTS ({max_recovery_attempts}) REACHED")
+                                    print(f"  Resetting recovery counter to try sequence again (infinite retry)")
+                                    recovery_attempts = 0
+                                    last_progress_time = current_time
+                                    last_best_error = float('inf')
+                                    last_progress_time = current_time
+                                    last_best_error = float('inf')
+                        
+                        # Legacy partial release if stuck counter (for faster response)
+                        partial_release = getattr(self, '_partial_release', False)
+                        if self._stuck_counter > 500 and best_error > 0.3 and not partial_release and not in_recovery_mode:
+                            print(f"\n⚠️ ARM STUCK - Enabling partial release on {anchored_arm} arm")
+                            self._partial_release = True
+                            self._stuck_counter = 0
                         
                         if phase_timer % 100 == 0:
-                            left_pos = self.get_left_gripper_pos()
                             body_pos = self.get_central_body_pos()
-                            print(f"  [{phase_timer:4d}] Left→WP1 | Error: {left_error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+                            is_final = current_waypoint_idx == total_waypoints - 1
+                            suffix = " [FINAL]" if is_final else ""
+                            print(f"  [{phase_timer:4d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){suffix}")
                         
-                        # Success - anchored at first waypoint (relaxed threshold for reliability)
-                        if left_error < 0.10:
-                            left_pos = self.get_left_gripper_pos()
-                            print(f"\n✅ WP{current_waypoint_idx+1} REACHED by LEFT arm! Error: {left_error:.3f}m")
+                        # Success - reached waypoint (must be close to target sphere)
+                        # Use STRICT thresholds - no fake reaching allowed
+                        # Use STRICT thresholds - no fake reaching allowed
+                        # Relaxed threshold to 0.20m to allow completion when arm is close but not exact
+                        is_final_waypoint = current_waypoint_idx == total_waypoints - 1
+                        success_threshold = 0.20 if is_final_waypoint else 0.22  # 20cm for final, 22cm for intermediate
+                        
+                        # NO FORCED ACCEPTANCE - Only genuine reaching counts
+                        
+                        should_accept = error < success_threshold
+                        
+                        
+                        
+                        
+                        
+                        if should_accept:
+                            print(f"\n✅ WP{current_waypoint_idx+1} REACHED by {moving_arm.upper()} arm! Error: {error:.3f}m")
                             
                             # ANCHOR AT THE VALID SPHERE POSITION (the target waypoint)
-                            anchor_position = np.array(current_target)
-                            self.left_arm_anchored = True
-                            self.left_anchor_position = anchor_position.copy()
-                            print(f"  🔒 LEFT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                            # NOT at the current arm position - this ensures we anchor at valid spheres only
+                            anchor_position = np.array(current_target)  # Use the target waypoint (valid sphere)
+                            
+                            if moving_arm == 'left':
+                                self.left_arm_anchored = True
+                                self.left_anchor_position = anchor_position.copy()
+                                print(f"  🔒 LEFT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                            else:
+                                self.right_arm_anchored = True
+                                self.right_anchor_position = anchor_position.copy()
+                                print(f"  🔒 RIGHT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
                             
                             # Initialize anchor deviation tracking for this waypoint
                             current_anchor_idx = current_waypoint_idx
                             anchor_deviation_history[current_anchor_idx] = {
                                 'anchor_pos': anchor_position.copy(),
-                                'arm': 'left',
+                                'arm': moving_arm,
                                 'max_deviation': 0.0,
                                 'deviations': []
                             }
                             
                             current_waypoint_idx += 1
+                            self._partial_release = False
+                            self._stuck_counter = 0
                             
                             if current_waypoint_idx < total_waypoints:
-                                # Move to next waypoint with right arm
+                                # Prepare for next waypoint
+                                is_final = current_waypoint_idx == total_waypoints - 1
+                                
+                                # Release previous anchor, swap arms (standard alternating)
+                                if anchored_arm == 'left':
+                                    self.left_arm_anchored = False
+                                    self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0
+                                    print(f"  🔓 LEFT arm RELEASED")
+                                else:
+                                    self.right_arm_anchored = False
+                                    self.data.xfrc_applied[self.right_ee_body_id, 0:3] = 0
+                                    print(f"  🔓 RIGHT arm RELEASED")
+                                
+                                # Swap arms - standard alternating locomotion
+                                moving_arm, anchored_arm = anchored_arm, moving_arm
                                 current_target = waypoints[current_waypoint_idx]
                                 current_target_wall = waypoint_walls[current_waypoint_idx]
-                                is_final = current_waypoint_idx == total_waypoints - 1
                                 # DISABLED: Orientation control makes final WP harder to reach
-                                # Position-only control is more reliable
                                 use_orientation_control = False
-                                moving_arm = 'right'
-                                anchored_arm = 'left'
-                                crawl_phase = 'reaching_waypoint'
+                                
+                                print(f"  ➡️  {moving_arm.upper()} arm moving to WP{current_waypoint_idx+1}{' [FINAL]' if is_final else ''}")
                                 phase_timer = 0
                                 best_error = float('inf')
-                                print(f"  🔒 Left arm LOCKED")
-                                print(f"  ➡️  Right arm moving to WP{current_waypoint_idx+1}")
                             else:
+                                # FINAL WAYPOINT REACHED - release the previous anchor
+                                # The arm that just reached the goal (moving_arm) is now anchored
+                                # The previous anchored_arm becomes free for screw task
+                                if anchored_arm == 'left':
+                                    self.left_arm_anchored = False
+                                    self.left_anchor_position = None
+                                    self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0
+                                    print(f"  🔓 LEFT arm RELEASED (now FREE for screw task)")
+                                else:
+                                    self.right_arm_anchored = False
+                                    self.right_anchor_position = None
+                                    self.data.xfrc_applied[self.right_ee_body_id, 0:3] = 0
+                                    print(f"  🔓 RIGHT arm RELEASED (now FREE for screw task)")
+                                
                                 crawl_phase = 'trajectory_complete'
                                 print(f"\n🎉 TRAJECTORY COMPLETE!")
-                    
-                    if phase_timer >= settling_timeout:
-                        print(f"\n⚠️ Timeout reaching WP1")
-                        crawl_phase = 'failed'
-                
-                elif crawl_phase == 'reaching_waypoint':
-                    # Alternating arm reaches next waypoint
-                    phase_timer += 1
-                    global_step += 1
-                    
-                    # First, set the moving arm's target so body pull knows where to go
-                    if moving_arm == 'left':
-                        self.left_target_position = current_target.copy()
-                    else:
-                        self.right_target_position = current_target.copy()
-                    
-                    # Apply anchor force to the anchored arm (now knows moving target for body pull)
-                    if anchored_arm == 'left' and self.left_anchor_position is not None:
-                        apply_anchor_force('left', self.left_anchor_position, '_prev_left_pos')
-                        self.left_target_position = self.left_anchor_position.copy()
-                        # Only control last 2 joints of anchored arm to maintain anchor
-                        # First 5 joints can be adjusted to help moving arm reach
-                        self.apply_arm_control('left', anchored_mode=True)
-                    elif anchored_arm == 'right' and self.right_anchor_position is not None:
-                        apply_anchor_force('right', self.right_anchor_position, '_prev_right_pos')
-                        self.right_target_position = self.right_anchor_position.copy()
-                        self.apply_arm_control('right', anchored_mode=True)
-                    
-                    # Moving arm reaches toward target
-                    # Also adjust first 5 joints of anchored arm to help body positioning
-                    if moving_arm == 'left':
-                        self.left_target_position = current_target.copy()  # Re-set after anchor overwrote
-                        if use_orientation_control:
-                            error = self.apply_arm_control_with_orientation('left', current_target_wall)
-                        else:
-                            error = self.apply_arm_control('left')
-                        arm_pos = self.get_left_gripper_pos()
+                                print(f"  Final position on {current_target_wall} wall")
+                                body_pos = self.get_central_body_pos()
+                                print(f"  Body at: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
                         
-                        # Use coordinated control when arm error > 0.15m to help body reposition
-                        if error > 0.15 and anchored_arm == 'right' and self.right_anchor_position is not None:
-                            self.apply_coordinated_arm_control('right', current_target, self.right_anchor_position)
-                    else:
-                        self.right_target_position = current_target.copy()  # Re-set after anchor overwrote
-                        if use_orientation_control:
-                            error = self.apply_arm_control_with_orientation('right', current_target_wall)
-                        else:
-                            error = self.apply_arm_control('right')
-                        arm_pos = self.get_right_gripper_pos()
-                        
-                        # Use coordinated control when arm error > 0.15m to help body reposition
-                        if error > 0.15 and anchored_arm == 'left' and self.left_anchor_position is not None:
-                            self.apply_coordinated_arm_control('left', current_target, self.left_anchor_position)
-                    
-                    # Track trajectory error for plotting
-                    trajectory_error_history['time_steps'].append(global_step)
-                    trajectory_error_history['errors'].append(error)
-                    trajectory_error_history['waypoint_idx'].append(current_waypoint_idx)
-                    trajectory_error_history['arm'].append(moving_arm)
-                    trajectory_error_history['phase'].append('reaching_waypoint')
-                    
-                    # Update display index for visualization
-                    self._current_waypoint_display_idx = current_waypoint_idx
-                    
-                    # ================================================================
-                    # BODY REPOSITIONING - Pull body toward optimal position for reaching
-                    # ================================================================
-                    body_pos = self.get_central_body_pos()
-                    # Get anchor position
-                    if anchored_arm == 'left':
-                        anchor_pos_now = self.left_anchor_position
-                    else:
-                        anchor_pos_now = self.right_anchor_position
-                    
-                    if anchor_pos_now is not None and current_target is not None:
-                        # Midpoint between anchor and target is ideal body position
-                        midpoint = (anchor_pos_now + current_target) / 2.0
-                        body_to_mid = midpoint - body_pos
-                        mid_distance = np.linalg.norm(body_to_mid)
-                        
-                        # Moderate force - don't pull anchor off wall
-                        if mid_distance > 0.05:
-                            body_vel = self.data.qvel[0:3]
-                            body_kp = 350.0  # REDUCED from 600 to prevent anchor drift
-                            body_kd = 80.0   # Higher damping for stability
-                            body_force = body_kp * body_to_mid - body_kd * body_vel
-                            self.data.xfrc_applied[self.central_body_id, 0:3] += body_force
-                    
-                    # ================================================================
-                    # STUCK DETECTION AND RECOVERY SYSTEM
-                    # ================================================================
-                    current_time = time.time()
-                    
-                    # Check if we're in recovery mode
-                    if in_recovery_mode:
-                        recovery_elapsed = current_time - recovery_start_time
-                        
-                        # RECOVERY STRATEGY: Rotate the ANCHORED arm to reposition body
-                        # This helps the moving arm reach its target by changing body position
-                        # FIX: Use anchored_arm instead of moving_arm for recovery rotation
-                        if anchored_arm == 'left':
-                            qpos_slice = self.left_arm_qpos_slice
-                            actuator_slice = self.left_arm_actuator_slice
-                        else:
-                            qpos_slice = self.right_arm_qpos_slice
-                            actuator_slice = self.right_arm_actuator_slice
-                        
-                        # Smoothly rotate joint1 towards target
-                        current_j1 = self.data.qpos[qpos_slice][0]
-                        j1_error = recovery_joint1_target - current_j1
-                        
-                        # Normalize angle error to [-pi, pi]
-                        while j1_error > np.pi:
-                            j1_error -= 2 * np.pi
-                        while j1_error < -np.pi:
-                            j1_error += 2 * np.pi
-                        
-                        # Apply joint1 rotation with optimized gain (faster for intelligent recovery)
-                        # Apply joint1 rotation with optimized gain
-                        j1_velocity = recovery_j1_velocity_gain * j1_error
-                        new_j1 = current_j1 + j1_velocity * self.model.opt.timestep
-                        
-                        # SMART RECOVERY: Also retract shoulder (J2) and bend elbow (J4) to "Turtle" the arm
-                        # This clears the workspace more effectively than just rotating
-                        target_j2 = -1.0
-                        target_j4 = 1.5
-                        
-                        current_j2 = self.data.qpos[qpos_slice][1]
-                        current_j4 = self.data.qpos[qpos_slice][3]
-                        
-                        new_j2 = current_j2 + 2.0 * (target_j2 - current_j2) * self.model.opt.timestep
-                        new_j4 = current_j4 + 2.0 * (target_j4 - current_j4) * self.model.opt.timestep
-                        
-                        # Set commands for Moving Arm
-                        current_cmd = self.data.ctrl[actuator_slice].copy()
-                        current_cmd[0] = new_j1  # Rotate
-                        current_cmd[1] = new_j2  # Retract Shoulder
-                        current_cmd[3] = new_j4  # Bend Elbow
-                        self.data.ctrl[actuator_slice] = current_cmd
-                        
-                        # Apply recovery to Moving Arm too (retract to clear workspace)
-                        # Since we're rotating the anchored arm, also turtle the moving arm
-                        if moving_arm == 'left':
-                            moving_actuator_slice = self.left_arm_actuator_slice
-                            moving_qpos_slice = self.left_arm_qpos_slice
-                        else:
-                            moving_actuator_slice = self.right_arm_actuator_slice
-                            moving_qpos_slice = self.right_arm_qpos_slice
+                        if phase_timer >= settling_timeout:
+                            # Timeout - but DON'T proceed to next waypoint
+                            # Only print status update, keep trying
+                            if phase_timer == settling_timeout:
+                                print(f"\n⏳ Still reaching WP{current_waypoint_idx+1} (timeout reached, continuing...)")
+                                print(f"  Best error so far: {best_error:.3f}m")
                             
-                        # Moving Arm Control: Retract J2/J4 to turtle
-                        moving_current_q = self.data.qpos[moving_qpos_slice]
-                        moving_current_j2 = moving_current_q[1]
-                        moving_current_j4 = moving_current_q[3]
+                            # Continue trying - reset timer but keep best_error
+                            # This allows infinite attempts until the arm is anchored
+                            if phase_timer % 1000 == 0:
+                                body_pos = self.get_central_body_pos()
+                                print(f"  [{phase_timer:5d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Best: {best_error:.3f}m")
+                    
+                    # LOG DYNAMICS (Every 10 steps = 20ms)
+                    if global_step % 10 == 0:
+                        dynamics_history['time_steps'].append(global_step * self.model.opt.timestep)
+                        dynamics_history['anchor_forces'].append(step_anchor_force)
+                        dynamics_history['body_torques'].append(current_body_torque)
+                        dynamics_history['anchor_arm'].append(step_anchor_arm_name)
+                    
+                    elif crawl_phase == 'trajectory_complete':
+                        # FINAL POSITION: Execute unscrewing task with proper IK control
+                        phase_timer += 1
                         
-                        moving_cmd = self.data.ctrl[moving_actuator_slice].copy()
-                        # Retract moving arm to clear workspace (don't rotate J1 - keep trying to reach)
-                        moving_cmd[1] += 2.0 * (target_j2 - moving_current_j2) * self.model.opt.timestep
-                        moving_cmd[3] += 2.0 * (target_j4 - moving_current_j4) * self.model.opt.timestep
-                        
-                        self.data.ctrl[moving_actuator_slice] = moving_cmd
-
-                        # Damping for other joints (J3, J5, J6, J7) is implicit as we don't actuate them strongly here?
-                        # No, we must ensure they don't drift.
-                        # Actually, keeping previous command for them (via copy) acts as position hold if using position control?
-                        # The actuator is position control. So `current_cmd` holds last commanded value?
-                        # Wait, `self.data.ctrl` persists? Yes.
-                        # So simply updating J1,J2,J4 handles them, others hold.
-                        
-                        if phase_timer % 100 == 0:
-                            print(f"  🔄 RECOVERY [{recovery_attempts}/{max_recovery_attempts}] J1: {np.degrees(current_j1):.1f}° → {np.degrees(recovery_joint1_target):.1f}° | {recovery_duration - recovery_elapsed:.1f}s left")
-                        
-                        # End recovery after duration
-                        if recovery_elapsed >= recovery_duration:
-                            in_recovery_mode = False
-                            best_error = float('inf')  # Reset best error to give fresh start
-                            last_progress_time = current_time  # Reset progress timer
-                            last_best_error = float('inf')
-                            print(f"\n  ✅ Recovery {recovery_attempts} complete - J1 repositioned, resuming control")
-                    else:
-                        # Track if error is improving
-                        if error < last_best_error - stuck_error_improvement_threshold:
-                            last_best_error = error
-                            last_progress_time = current_time
-                        
-                        if error < best_error:
-                            best_error = error
-                            self._stuck_counter = 0
-                        else:
-                            self._stuck_counter += 1
-                        
-                        # Check if stuck (no progress for stuck_detection_threshold seconds)
-                        time_without_progress = current_time - last_progress_time
-                        
-                        if time_without_progress > stuck_detection_threshold and error > 0.12:
-                            if recovery_attempts < max_recovery_attempts:
-                                max_recovery_attempts = 15  # Increased to allow cycling through all strategies (3 standard + panic) multiple times
-                                stuck_error_improvement_threshold = 0.001
-                                stuck_detection_threshold = 5.0 # Check stuck every 5s
-                                
-                                recovery_attempts += 1
-                                in_recovery_mode = True
-                                recovery_start_time = current_time
-                                
-                                # Get current joint1 angle for computing target
-                                # FIX: Use ANCHORED arm since that's what we're rotating in recovery
-                                if anchored_arm == 'left':
-                                    current_j1 = self.data.qpos[self.left_arm_qpos_slice][0]
-                                else:
-                                    current_j1 = self.data.qpos[self.right_arm_qpos_slice][0]
-                                
-                                # Recovery strategies: Rotate RELATIVE to current position
-                                # Each recovery moves the arm a different amount
-                                recovery_rotation = [np.pi, np.pi/2, -np.pi/2, np.pi*0.75, -np.pi*0.75]
-                                strategy_idx = (recovery_attempts - 1) % len(recovery_rotation)
-                                rotation_amount = recovery_rotation[strategy_idx]
-                                recovery_joint1_target = current_j1 + rotation_amount
-                                
-                                # Normalize to [-pi, pi]
-                                while recovery_joint1_target > np.pi:
-                                    recovery_joint1_target -= 2 * np.pi
-                                while recovery_joint1_target < -np.pi:
-                                    recovery_joint1_target += 2 * np.pi
-                                
-                                # Human-readable strategy names
-                                strategy_names = ["180° FLIP", "+90° ROTATE", "-90° ROTATE", "+135° ROTATE", "-135° ROTATE"]
-                                strategy_name = strategy_names[strategy_idx]
-
-                                print(f"    - Strategy: {strategy_name}")
-                                print(f"    - J1: {np.degrees(current_j1):.1f}° → {np.degrees(recovery_joint1_target):.1f}°")
-                                
-                                # DUAL-ARM RECOVERY: Apply J1 target to BOTH arms to clear workspace
-                                # The 'moving_arm' logic below only sets one. We will override both in the loop.
+                        # Initialize unscrewing task on first entry
+                        if not hasattr(self, '_unscrew_initialized') or not self._unscrew_initialized:
+                            self._unscrew_initialized = True
+                            self._unscrew_delay = 50  # Wait 50 steps before starting
+                            self._unscrew_started = False
+                            
+                            # Determine which arm reached the final waypoint (is anchored at screw)
+                            # That arm does the unscrewing, the other provides anchor support
+                            if self.left_anchor_position is not None and self.right_anchor_position is None:
+                                screw_arm = 'left'
+                                anchor_arm = 'right'
+                                print(f"\n  🔒 FINAL POSITION REACHED")
+                                print(f"     LEFT arm at screw → will unscrew")
+                                print(f"     RIGHT arm provides anchor support")
+                            elif self.right_anchor_position is not None and self.left_anchor_position is None:
+                                screw_arm = 'right'
+                                anchor_arm = 'left'
+                                print(f"\n  🔒 FINAL POSITION REACHED")
+                                print(f"     RIGHT arm at screw → will unscrew")
+                                print(f"     LEFT arm provides anchor support")
                             else:
-                                print(f"\n❌ MAX RECOVERY ATTEMPTS ({max_recovery_attempts}) REACHED")
-                                print(f"  Resetting recovery counter to try sequence again (infinite retry)")
-                                recovery_attempts = 0
-                                last_progress_time = current_time
-                                last_best_error = float('inf')
-                                last_progress_time = current_time
-                                last_best_error = float('inf')
-                    
-                    # Legacy partial release if stuck counter (for faster response)
-                    partial_release = getattr(self, '_partial_release', False)
-                    if self._stuck_counter > 500 and best_error > 0.3 and not partial_release and not in_recovery_mode:
-                        print(f"\n⚠️ ARM STUCK - Enabling partial release on {anchored_arm} arm")
-                        self._partial_release = True
-                        self._stuck_counter = 0
-                    
-                    if phase_timer % 100 == 0:
-                        body_pos = self.get_central_body_pos()
-                        is_final = current_waypoint_idx == total_waypoints - 1
-                        suffix = " [FINAL]" if is_final else ""
-                        print(f"  [{phase_timer:4d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Body: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f}){suffix}")
-                    
-                    # Success - reached waypoint (must be close to target sphere)
-                    # Use STRICT thresholds - no fake reaching allowed
-                    # Use STRICT thresholds - no fake reaching allowed
-                    # Relaxed threshold to 0.20m to allow completion when arm is close but not exact
-                    is_final_waypoint = current_waypoint_idx == total_waypoints - 1
-                    success_threshold = 0.20 if is_final_waypoint else 0.22  # 20cm for final, 22cm for intermediate
-                    
-                    # NO FORCED ACCEPTANCE - Only genuine reaching counts
-                    
-                    should_accept = error < success_threshold
-                    
-                    
-                    
-                    
-                    
-                    if should_accept:
-                        print(f"\n✅ WP{current_waypoint_idx+1} REACHED by {moving_arm.upper()} arm! Error: {error:.3f}m")
+                                # Default case - use left arm
+                                screw_arm = 'left'
+                                anchor_arm = 'right'
+                                print(f"\n  🔒 FINAL POSITION - defaulting to LEFT arm for unscrew")
+                            
+                            self._unscrew_screw_arm = screw_arm
+                            self._unscrew_anchor_arm_name = anchor_arm
+                            
+                            # Get the screw wall from stored info
+                            screw_wall = getattr(self, '_screw_wall', 'back')
+                            
+                            # Store body position for locking
+                            self._final_body_pos = self.get_central_body_pos().copy()
+                            self._final_body_quat = self.data.qpos[3:7].copy()
+                            print(f"  🔒 Body locked at: ({self._final_body_pos[0]:.2f}, {self._final_body_pos[1]:.2f}, {self._final_body_pos[2]:.2f})")
+                            
+                            # Mark trajectory as successful
+                            trajectory_success = True
                         
-                        # ANCHOR AT THE VALID SPHERE POSITION (the target waypoint)
-                        # NOT at the current arm position - this ensures we anchor at valid spheres only
-                        anchor_position = np.array(current_target)  # Use the target waypoint (valid sphere)
+                        # Start unscrewing after delay
+                        if phase_timer >= self._unscrew_delay and not self._unscrew_started:
+                            self._unscrew_started = True
+                            screw_wall = getattr(self, '_screw_wall', 'back')
+                            self._init_unscrew_task(
+                                self._unscrew_screw_arm, 
+                                self._unscrew_anchor_arm_name,
+                                screw_wall
+                            )
                         
-                        if moving_arm == 'left':
-                            self.left_arm_anchored = True
-                            self.left_anchor_position = anchor_position.copy()
-                            print(f"  🔒 LEFT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
+                        # Execute unscrewing step
+                        if self._unscrew_started:
+                            unscrew_complete = self._step_unscrew_task()
+                            
+                            if unscrew_complete and not hasattr(self, '_mission_complete_printed'):
+                                self._mission_complete_printed = True
+                                print(f"============================================================")
+                                print(f"✅ GLOBAL_SUCCESS_TOKEN")
+                                print(f"✅ MISSION COMPLETE")
+                            
+                            # Print status periodically
+                            if phase_timer % 250 == 0 and not self._unscrew_complete:
+                                rotations = self._unscrew_total_rotation / (2 * np.pi)
+                                ee_pos = self.get_left_gripper_pos() if self._unscrew_arm == 'left' else self.get_right_gripper_pos()
+                                screw_pos = self.data.xpos[self._unscrew_screw_body_id]
+                                ee_dist = np.linalg.norm(ee_pos - screw_pos) * 1000
+                                print(f"  🔩 Unscrew: {rotations:.2f}/{self._unscrew_target_rotations} turns | EE-screw: {ee_dist:.0f}mm")
                         else:
-                            self.right_arm_anchored = True
-                            self.right_anchor_position = anchor_position.copy()
-                            print(f"  🔒 RIGHT arm ANCHORED at sphere ({anchor_position[0]:.2f}, {anchor_position[1]:.2f}, {anchor_position[2]:.2f})")
-                        
-                        # Initialize anchor deviation tracking for this waypoint
-                        current_anchor_idx = current_waypoint_idx
-                        anchor_deviation_history[current_anchor_idx] = {
-                            'anchor_pos': anchor_position.copy(),
-                            'arm': moving_arm,
-                            'max_deviation': 0.0,
-                            'deviations': []
-                        }
-                        
-                        current_waypoint_idx += 1
-                        self._partial_release = False
-                        self._stuck_counter = 0
-                        
-                        if current_waypoint_idx < total_waypoints:
-                            # Prepare for next waypoint
-                            is_final = current_waypoint_idx == total_waypoints - 1
-                            
-                            # Release previous anchor, swap arms (standard alternating)
-                            if anchored_arm == 'left':
-                                self.left_arm_anchored = False
-                                self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0
-                                print(f"  🔓 LEFT arm RELEASED")
-                            else:
-                                self.right_arm_anchored = False
-                                self.data.xfrc_applied[self.right_ee_body_id, 0:3] = 0
-                                print(f"  🔓 RIGHT arm RELEASED")
-                            
-                            # Swap arms - standard alternating locomotion
-                            moving_arm, anchored_arm = anchored_arm, moving_arm
-                            current_target = waypoints[current_waypoint_idx]
-                            current_target_wall = waypoint_walls[current_waypoint_idx]
-                            # DISABLED: Orientation control makes final WP harder to reach
-                            use_orientation_control = False
-                            
-                            print(f"  ➡️  {moving_arm.upper()} arm moving to WP{current_waypoint_idx+1}{' [FINAL]' if is_final else ''}")
-                            phase_timer = 0
-                            best_error = float('inf')
-                        else:
-                            # FINAL WAYPOINT REACHED - release the previous anchor
-                            # The arm that just reached the goal (moving_arm) is now anchored
-                            # The previous anchored_arm becomes free for screw task
-                            if anchored_arm == 'left':
-                                self.left_arm_anchored = False
-                                self.left_anchor_position = None
-                                self.data.xfrc_applied[self.left_ee_body_id, 0:3] = 0
-                                print(f"  🔓 LEFT arm RELEASED (now FREE for screw task)")
-                            else:
-                                self.right_arm_anchored = False
-                                self.right_anchor_position = None
-                                self.data.xfrc_applied[self.right_ee_body_id, 0:3] = 0
-                                print(f"  🔓 RIGHT arm RELEASED (now FREE for screw task)")
-                            
-                            crawl_phase = 'trajectory_complete'
-                            print(f"\n🎉 TRAJECTORY COMPLETE!")
-                            print(f"  Final position on {current_target_wall} wall")
-                            body_pos = self.get_central_body_pos()
-                            print(f"  Body at: ({body_pos[0]:.2f}, {body_pos[1]:.2f}, {body_pos[2]:.2f})")
+                            # Lock body during delay
+                            self.data.qpos[0:3] = self._final_body_pos
+                            self.data.qpos[3:7] = self._final_body_quat
+                            self.data.qvel[0:6] = 0.0
                     
-                    if phase_timer >= settling_timeout:
-                        # Timeout - but DON'T proceed to next waypoint
-                        # Only print status update, keep trying
-                        if phase_timer == settling_timeout:
-                            print(f"\n⏳ Still reaching WP{current_waypoint_idx+1} (timeout reached, continuing...)")
-                            print(f"  Best error so far: {best_error:.3f}m")
-                        
-                        # Continue trying - reset timer but keep best_error
-                        # This allows infinite attempts until the arm is anchored
-                        if phase_timer % 1000 == 0:
-                            body_pos = self.get_central_body_pos()
-                            print(f"  [{phase_timer:5d}] {moving_arm.upper()}→WP{current_waypoint_idx+1} | Error: {error:.3f}m | Best: {best_error:.3f}m")
-                
-                elif crawl_phase == 'trajectory_complete':
-                    # FINAL POSITION: Execute unscrewing task with proper IK control
-                    phase_timer += 1
+                    elif crawl_phase == 'failed':
+                        # Error state - just hold position
+                        phase_timer += 1
+                        if phase_timer % 500 == 0:
+                            print(f"  [FAILED] Holding position...")
                     
-                    # Initialize unscrewing task on first entry
-                    if not hasattr(self, '_unscrew_initialized') or not self._unscrew_initialized:
-                        self._unscrew_initialized = True
-                        self._unscrew_delay = 50  # Wait 50 steps before starting
-                        self._unscrew_started = False
-                        
-                        # Determine which arm reached the final waypoint (is anchored at screw)
-                        # That arm does the unscrewing, the other provides anchor support
-                        if self.left_anchor_position is not None and self.right_anchor_position is None:
-                            screw_arm = 'left'
-                            anchor_arm = 'right'
-                            print(f"\n  🔒 FINAL POSITION REACHED")
-                            print(f"     LEFT arm at screw → will unscrew")
-                            print(f"     RIGHT arm provides anchor support")
-                        elif self.right_anchor_position is not None and self.left_anchor_position is None:
-                            screw_arm = 'right'
-                            anchor_arm = 'left'
-                            print(f"\n  🔒 FINAL POSITION REACHED")
-                            print(f"     RIGHT arm at screw → will unscrew")
-                            print(f"     LEFT arm provides anchor support")
-                        else:
-                            # Default case - use left arm
-                            screw_arm = 'left'
-                            anchor_arm = 'right'
-                            print(f"\n  🔒 FINAL POSITION - defaulting to LEFT arm for unscrew")
-                        
-                        self._unscrew_screw_arm = screw_arm
-                        self._unscrew_anchor_arm_name = anchor_arm
-                        
-                        # Get the screw wall from stored info
-                        screw_wall = getattr(self, '_screw_wall', 'back')
-                        
-                        # Store body position for locking
-                        self._final_body_pos = self.get_central_body_pos().copy()
-                        self._final_body_quat = self.data.qpos[3:7].copy()
-                        print(f"  🔒 Body locked at: ({self._final_body_pos[0]:.2f}, {self._final_body_pos[1]:.2f}, {self._final_body_pos[2]:.2f})")
-                        
-                        # Mark trajectory as successful
-                        trajectory_success = True
+                    # ============================================================
+                    # END STATE MACHINE
+                    # ============================================================
                     
-                    # Start unscrewing after delay
-                    if phase_timer >= self._unscrew_delay and not self._unscrew_started:
-                        self._unscrew_started = True
-                        screw_wall = getattr(self, '_screw_wall', 'back')
-                        self._init_unscrew_task(
-                            self._unscrew_screw_arm, 
-                            self._unscrew_anchor_arm_name,
-                            screw_wall
-                        )
+                    # Step physics - robot body is FREE from the start
+                    mujoco.mj_step(self.model, self.data)
                     
-                    # Execute unscrewing step
-                    if self._unscrew_started:
-                        unscrew_complete = self._step_unscrew_task()
+                    # WORKSPACE BOUNDARY ENFORCEMENT
+                    # Clamp body position to stay within ISS module bounds
+                    # This prevents the body from drifting into walls/ceiling
+                    body_pos = self.data.qpos[0:3]
+                    margin = 0.2  # Keep body 20cm from walls
+                    body_pos[0] = np.clip(body_pos[0], ISS_MODULE['x_min'] + margin, ISS_MODULE['x_max'] - margin)
+                    body_pos[1] = np.clip(body_pos[1], ISS_MODULE['y_min'] + margin, ISS_MODULE['y_max'] - margin)
+                    body_pos[2] = np.clip(body_pos[2], ISS_MODULE['z_min'] + margin, ISS_MODULE['z_max'] - margin)
+                    
+                    # Render visualization geometries
+                    with viewer.lock():
+                        self._render_visualization_geoms(viewer)
+                        if first_render:
+                            print(f"✓ Added {viewer.user_scn.ngeom} custom geometries to scene")
+                            first_render = False
+                    
+                    # Sync viewer
+                    viewer.sync()
+                    
+                    # Check duration
+                    if duration and (time.time() - start_time) >= duration:
+                        break
+                    
+                    step_count += 1
+                    
+                    # Real-time sync
+                    time_until_next = self.model.opt.timestep - (time.time() - step_start)
+                    if time_until_next > 0:
+                        time.sleep(time_until_next)
                         
-                        if unscrew_complete and not hasattr(self, '_mission_complete_printed'):
-                            self._mission_complete_printed = True
-                            print(f"============================================================")
-                            print(f"✅ GLOBAL_SUCCESS_TOKEN")
-                            print(f"✅ MISSION COMPLETE")
-                        
-                        # Print status periodically
-                        if phase_timer % 250 == 0 and not self._unscrew_complete:
-                            rotations = self._unscrew_total_rotation / (2 * np.pi)
-                            ee_pos = self.get_left_gripper_pos() if self._unscrew_arm == 'left' else self.get_right_gripper_pos()
-                            screw_pos = self.data.xpos[self._unscrew_screw_body_id]
-                            ee_dist = np.linalg.norm(ee_pos - screw_pos) * 1000
-                            print(f"  🔩 Unscrew: {rotations:.2f}/{self._unscrew_target_rotations} turns | EE-screw: {ee_dist:.0f}mm")
-                    else:
-                        # Lock body during delay
-                        self.data.qpos[0:3] = self._final_body_pos
-                        self.data.qpos[3:7] = self._final_body_quat
-                        self.data.qvel[0:6] = 0.0
-                
-                elif crawl_phase == 'failed':
-                    # Error state - just hold position
-                    phase_timer += 1
-                    if phase_timer % 500 == 0:
-                        print(f"  [FAILED] Holding position...")
-                
-                # ============================================================
-                # END STATE MACHINE
-                # ============================================================
-                
-                # Step physics - robot body is FREE from the start
-                mujoco.mj_step(self.model, self.data)
-                
-                # WORKSPACE BOUNDARY ENFORCEMENT
-                # Clamp body position to stay within ISS module bounds
-                # This prevents the body from drifting into walls/ceiling
-                body_pos = self.data.qpos[0:3]
-                margin = 0.2  # Keep body 20cm from walls
-                body_pos[0] = np.clip(body_pos[0], ISS_MODULE['x_min'] + margin, ISS_MODULE['x_max'] - margin)
-                body_pos[1] = np.clip(body_pos[1], ISS_MODULE['y_min'] + margin, ISS_MODULE['y_max'] - margin)
-                body_pos[2] = np.clip(body_pos[2], ISS_MODULE['z_min'] + margin, ISS_MODULE['z_max'] - margin)
-                
-                # Render visualization geometries
-                with viewer.lock():
-                    self._render_visualization_geoms(viewer)
-                    if first_render:
-                        print(f"✓ Added {viewer.user_scn.ngeom} custom geometries to scene")
-                        first_render = False
-                
-                # Sync viewer
-                viewer.sync()
-                
-                # Check duration
-                if duration and (time.time() - start_time) >= duration:
-                    break
-                
-                step_count += 1
-                
-                # Real-time sync
-                time_until_next = self.model.opt.timestep - (time.time() - step_start)
-                if time_until_next > 0:
-                    time.sleep(time_until_next)
+            except KeyboardInterrupt:
+                print("\n⚠️ Simulation interrupted by user")
+            except Exception as e:
+                print(f"\n⚠️ Simulation error: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                pass  # Fall through to summary
         
         # ================================================================
         # END OF SIMULATION - SUMMARY AND ANALYSIS

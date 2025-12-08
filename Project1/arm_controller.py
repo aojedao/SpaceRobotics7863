@@ -29,8 +29,8 @@ class ArmControllerConfig:
     joint_gain_scale: np.ndarray = None
     
     # Anchor control gains
-    kp_anchor: float = 800.0
-    kd_anchor: float = 40.0
+    kp_anchor: float = 2000.0
+    kd_anchor: float = 100.0
     
     # Gripper values
     gripper_open_value: int = 0
