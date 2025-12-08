@@ -822,13 +822,13 @@ class WallCrawlerMuJoCoSimulation:
         
         # Position error
         pos_error = target_pos - current_pos
-        kp_pos = 800.0  # High gain for strict position tracking
+        kp_pos = 150.0  # Reduced gain to prevent instability
         
         # Orientation error - EE Z-axis should align with NEGATIVE screw axis
         desired_z = -screw_axis  # Gripper Z points into wall
         current_z = current_orient[:, 2]
         orient_error = np.cross(current_z, desired_z)
-        kp_orient = 200.0
+        kp_orient = 50.0  # Reduced orientation gain
         
         # Get Jacobians
         jacp, jacr = self.compute_jacobian_at_site(site_id)
@@ -843,17 +843,24 @@ class WallCrawlerMuJoCoSimulation:
         J_full = np.vstack([J_pos * 2.0, J_rot])  # Double weight on position
         task_vel = np.concatenate([kp_pos * pos_error, kp_orient * orient_error])
         
-        # Damped least squares
-        lambda_dls = 0.01
+        # Damped least squares with higher damping for stability
+        lambda_dls = 0.05  # Increased from 0.01 for more stable IK
         JJT = J_full @ J_full.T
         J_pinv = J_full.T @ np.linalg.inv(JJT + lambda_dls**2 * np.eye(6))
         joint_vel = J_pinv @ task_vel
+        
+        # Clip joint velocities to prevent instability
+        max_joint_vel = 0.5  # rad/s limit for stability
+        joint_vel = np.clip(joint_vel, -max_joint_vel, max_joint_vel)
         
         # Apply to joints 1-6 only (not J7)
         # Update BOTH qpos AND ctrl to ensure arm actually moves
         dt = self.model.opt.timestep
         for i in range(6):
             new_q = self.data.qpos[qpos_slice.start + i] + joint_vel[i] * dt
+            # Clamp to joint limits
+            jnt_range = self.model.jnt_range[qpos_slice.start + i]
+            new_q = np.clip(new_q, jnt_range[0] + 0.01, jnt_range[1] - 0.01)
             self.data.qpos[qpos_slice.start + i] = new_q  # Update position state
             self.data.ctrl[actuator_slice.start + i] = new_q  # Update control target
         
