@@ -2,6 +2,8 @@
 
 This repository contains projects and coursework for ROB-GY 7863: Space Robotics at the NYU Tandon School of Engineering.
 
+![SpaceRobotics.gif](Documentation/SpaceRobotics.gif)
+
 ## Project 1: Simulating In-Space Disassembly Tasks in a Zero-G Environment
 
 ![ezgif-496f20b11beee9.gif](ezgif-496f20b11beee9.gif)
