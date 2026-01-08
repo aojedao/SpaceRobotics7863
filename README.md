@@ -46,4 +46,6 @@ The simulation is built using the MuJoCo physics engine and leverages models fro
   - `*.xml`: MuJoCo model files defining the robot, objects, and environment.
   - `*.stl`: STL files for custom geometries like the target box.
   - `Report.tex` / `ref.bib`: The LaTeX source for the project report and its citations.
+  - `docs/`: Comprehensive documentation including quickstart guides, technical deep dives, and implementation guides.
+- `Documentation/`: Project materials including proposal, diagrams, and reference materials.
 - `mujoco_menagerie/`: Contains the original robot models from the Google MuJoCo Menagerie.
